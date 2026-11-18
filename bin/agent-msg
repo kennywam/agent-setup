@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# agent-msg: shared message board for agents working on the Mac mini, read by the MacBook coordinator.
+# Board: ~/.agent-bus/<project>.jsonl (one JSON message per line; the line number is the message id).
+set -euo pipefail
+BUS="${AGENT_BUS_DIR:-$HOME/.agent-bus}"
+KINDS="status notice claim plan question ask-user blocker review done stopped answer decision finding task"
+usage() {
+  cat <<'U'
+agent-msg post <kind> "<text>" [--to <terminal|all|coordinator|user>]  (default: by kind) [--re ID] [--project P] [--as NAME]
+                [--verdict approved|changes_requested|blocked] [--finding "severity|files|description|action"]...
+                [--task T]  (default: $AGENT_TASK) links the message to a task in agent-task
+agent-msg read [--after N] [--last N] [--kind K] [--project P] [--json]
+agent-msg verify    run the project's checks; stamps your commit so `post done` is allowed
+                    (after a clean merge of origin/dev onto a verified commit it skips the checks;
+                    `post done` then needs green CI on that commit instead)
+agent-msg summary   one line per agent: last message, plans/questions asked, minutes since its first post
+agent-msg kinds
+
+Kinds (who acts on it):
+  plan       your plan before coding (files, approach, tests). End your turn and wait for approval.
+  question   needs the coordinator to decide. End your turn and wait for the answer.
+  ask-user   needs the human (product call, secrets, money, destructive or irreversible
+             steps, scope change). End your turn and wait.
+  blocker    you can't continue (broken env, failing setup, conflict). End your turn.
+  review     a reviewer agent's findings on a PR (reviewers only).
+  done       finished; include the PR URL and anything the reviewer must know. Refused until
+             `agent-msg verify` passed on your current commit with nothing uncommitted.
+  claim      files or areas you're about to change, so other agents avoid them.
+  notice     something other agents should know (you changed a shared file, rebased dev...).
+  status     progress note; doesn't wake anyone.
+  stopped    posted by a hook when an agent ends its turn without posting a plan, question,
+             ask-user, blocker, review or done. Don't post it yourself.
+  answer     a reply (used by the coordinator); include --to and --re.
+  decision   a standing decision for this project (coordinator). Read them: agent-msg read --kind decision
+  finding    something you learned that others working on the task need: a dependency, a risk, a test
+             result, a contract you defined, the reason for a choice. Doesn't wake anyone.
+  task       posted by agent-task when a task changes. Don't post it yourself.
+
+With a task (--task or AGENT_TASK), your plan, findings, reviews and done are what the next agent gets from
+`agent-task show <T>`, so write them for a reader who has none of your context.
+U
+}
+# True when an ancestor process is the shared Codex app-server daemon. Commands run there lose the
+# Herdr tab's HC_TERMINAL_ID and AGENT_TASK; agents must be started as `codex --no-daemon`.
+in_codex_daemon() {
+  local p=$PPID
+  while [[ -n $p && $p -gt 1 && -r /proc/$p/cmdline ]]; do
+    [[ $(tr '\0' ' ' < "/proc/$p/cmdline") == *"codex app-server"* ]] && return 0
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  done
+  return 1
+}
+project_default() {
+  local common; common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || { basename "$PWD"; return; }
+  basename "$(dirname "$common")"
+}
+# True when HEAD merges a pushed branch (e.g. origin/dev) into a commit listed in the verified log as a plain
+# automatic merge (no hand-resolved conflicts or extra edits) and no file changed on both sides.
+clean_dev_merge() {
+  local log=$1 p1 p2 extra base
+  read -r p1 p2 extra < <(git log -1 --format=%P HEAD)
+  [[ -n ${p2:-} && -z ${extra:-} ]] || return 1
+  grep -qx "$p1" "$log" 2>/dev/null || return 1   # first parent passed the full checks in this worktree
+  [[ -n $(git branch -r --contains "$p2" 2>/dev/null) ]] || return 1
+  base=$(git merge-base "$p1" "$p2") || return 1
+  [[ $(git merge-tree --write-tree "$p1" "$p2" 2>/dev/null | head -1) == $(git rev-parse "HEAD^{tree}") ]] || return 1
+  [[ -z $(comm -12 <(git diff --name-only "$base" "$p1" | sort) <(git diff --name-only "$base" "$p2" | sort)) ]]
+}
+cmd="${1:-}"; shift || true
+project=""; to=""; re=""; kfilter=""; as="${AGENT_NAME:-}"; after=0; json=0; last=0; task="${AGENT_TASK:-}"
+verdict=""; findings=(); supplied_exec=""; has_exec=0
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --exec) supplied_exec="$2"; has_exec=1; shift 2;;
+    --verdict) verdict="$2"; shift 2;;
+    --finding) findings+=("$2"); shift 2;;
+    --project) project="$2"; shift 2;;
+    --to) to="$2"; shift 2;;
+    --re) re="$2"; shift 2;;
+    --task) task="$2"; shift 2;;
+    --kind) kfilter="$2"; shift 2;;
+    --as) as="$2"; shift 2;;
+    --after) after="$2"; shift 2;;
+    --last) last="$2"; shift 2;;
+    --json) json=1; shift;;
+    *) args+=("$1"); shift;;
+  esac
+done
+[[ -n "$project" ]] || project=$(project_default)
+mkdir -p "$BUS"; file="$BUS/$project.jsonl"; touch "$file"
+# Resolve identity once, including on verify. Missing hc must not prevent a board post.
+resolve_execution() {
+  execution="$supplied_exec"; provider=""
+  [[ $has_exec -eq 0 ]] || return 0
+  # MacBook-forwarded posts (macbook/tN) aren't Mini executions: an hc get would mint a wrong mac-mini/ id.
+  if [[ -n ${HC_TERMINAL_ID:-} && -z ${AGENT_REMOTE:-} ]]; then
+    local info
+    info=$(timeout 1 "${AGENT_BUS_HC:-hc}" get "$HC_TERMINAL_ID" --json 2>/dev/null) || return 0
+    execution=$(jq -r --arg t "$HC_TERMINAL_ID" 'if (.created_ms|type)=="number" then "mac-mini/"+$t+"@"+(.created_ms|tostring) else "" end' <<<"$info" 2>/dev/null) || execution=""
+    provider=$(jq -r '.status.app // "" | if .=="claude-code" then "claude" elif .=="codex" then "codex" else "" end' <<<"$info" 2>/dev/null) || provider=""
+  fi
+}
+record_tests() {
+  [[ -n $task ]] || return 0
+  "$(dirname "$0")/agent-task" _tests "$task" "$1" --project "$project" --exec "$execution" \
+    --rev "$(git rev-parse HEAD)" --command "$(cat "$vf")" >/dev/null 2>&1 || true
+}
+board_event() {
+  local type=$1 meta=$2 suffix=${3:-}
+  local flags=(--project "$project" --source agent-msg --key "board:$project:$id:$type$suffix" --summary "$text" --meta "$meta")
+  [[ -z $task ]] || flags+=(--task "$task")
+  [[ -z $execution ]] || flags+=(--exec "$execution" --agent "mac-mini/$from")
+  [[ -z $provider ]] || flags+=(--provider "$provider")
+  "$(dirname "$0")/agent-event" emit "$type" "${flags[@]}" >/dev/null 2>&1 || true
+}
+case "$cmd" in
+  post)
+    [[ ${#args[@]} -ge 2 ]] || { usage >&2; exit 2; }
+    kind="${args[0]}"; text="${args[*]:1}"
+    if [[ -z "$to" ]]; then case "$kind" in ask-user) to=user;; plan|question|blocker|review|done|stopped) to=coordinator;; *) to=all;; esac; fi
+    [[ " $KINDS " == *" $kind "* ]] || { echo "unknown kind '$kind' (one of: $KINDS)" >&2; exit 2; }
+    # MacBook tasks (AGENT_REMOTE, set by the MacBook forwarder) have no worktree here: CI on their PR is the check.
+    if [[ $kind == done && -f "$BUS/$project.verify" && -z ${AGENT_REMOTE:-} ]]; then
+      gd=$(git rev-parse --absolute-git-dir 2>/dev/null) || { echo "post done from inside your worktree" >&2; exit 2; }
+      [[ -z $(git status --porcelain --untracked-files=no) ]] || { echo "uncommitted changes: commit them, run 'agent-msg verify', then post done" >&2; exit 2; }
+      read -r vsha vmode < "$gd/agent-verified" 2>/dev/null || true
+      [[ ${vsha:-} == $(git rev-parse HEAD) ]] || { echo "run 'agent-msg verify' on this commit first (it can take 10+ minutes: use a long Bash timeout or run it in the background)" >&2; exit 2; }
+      if [[ ${vmode:-} == ci ]]; then   # clean dev merge: local checks were skipped, so green CI on this exact commit is the gate
+        [[ $(gh pr view --json headRefOid -q .headRefOid 2>/dev/null) == "$vsha" ]] || { echo "push this commit to your PR first; done needs green CI on it" >&2; exit 2; }
+        rc=0; gh pr checks >/dev/null 2>&1 || rc=$?
+        case $rc in
+          0) ;;
+          8) echo "CI is still running on this commit: wait for it (gh pr checks --watch), then post done" >&2; exit 2;;
+          *) echo "CI is failing or has not reported on this commit yet: check gh pr checks; fix failures, or wait and retry" >&2; exit 2;;
+        esac
+      fi
+    fi
+    from="${HC_TERMINAL_ID:-unknown}"
+    if [[ $from == unknown ]] && in_codex_daemon; then
+      echo "agent-msg: warning: this Codex runs commands in its shared daemon, so HC_TERMINAL_ID and AGENT_TASK are" >&2
+      echo "missing: this post shows as 'unknown' and isn't linked to your task. Tell the coordinator (put your task id" >&2
+      echo "in the text): it must restart you as 'codex --no-daemon'." >&2
+    fi
+    if [[ -n $verdict && ( $kind != review || ! $verdict =~ ^(approved|changes_requested|blocked)$ ) ]]; then
+      echo "--verdict requires a review and approved|changes_requested|blocked" >&2; exit 2
+    fi
+    for finding in "${findings[@]}"; do
+      if [[ $kind != review || ! $finding =~ ^(blocking|major|minor|info)\|[^\|]*\|[^\|]+\|.*$ ]]; then
+        echo "--finding requires a review and severity|files|description|action" >&2; exit 2
+      fi
+    done
+    resolve_execution
+    rev=$(git rev-parse HEAD 2>/dev/null || true)
+    branch=$(git branch --show-current 2>/dev/null || true)
+    exec 9>>"$file.lock"; flock 9
+    previous=""
+    if [[ $kind == done && -n $execution ]]; then
+      previous=$(jq -rs --arg x "$execution" --arg branch "$branch" '[.[]|select(.kind=="done" and .exec==$x and .branch==$branch)|.rev // empty]|last // ""' "$file")
+      if [[ -z $previous && -n $task && -f "$BUS/$project.tasks.json" ]]; then
+        previous=$(jq -r --arg task "$task" '.tasks[$task].revisions[-1] // empty' "$BUS/$project.tasks.json" 2>/dev/null) || previous=""
+      fi
+      if [[ -z $previous ]]; then
+        for base in dev main master; do
+          previous=$(git merge-base "$base" "$rev" 2>/dev/null) && break
+        done
+      fi
+    fi
+    id=$(( $(wc -l < "$file") + 1 ))
+    jq -cn --argjson id "$id" --arg ts "$(date -Is)" --arg project "$project" --arg from "$from" \
+      --arg as "$as" --arg kind "$kind" --arg to "$to" --arg text "$text" --arg branch "$branch" --arg cwd "$PWD" --arg re "$re" --arg task "$task" --arg execution "$execution" --arg rev "$rev" \
+      '{id:$id,ts:$ts,project:$project,from:$from,as:$as,kind:$kind,to:$to,re:$re,text:$text,branch:$branch,cwd:$cwd,exec:(if $execution=="" then null else $execution end),rev:$rev}
+       + (if $task != "" then {task:$task} else {} end)' >> "$file"
+    exec 9>&-
+    echo "posted #$id ($kind) to $project board${task:+ for $task}"
+    auto_result=""
+    if [[ -n $task && $kind =~ ^(status|claim|plan|finding|notice|question|done|blocker|review)$ ]]; then
+      auto=(--project "$project" --exec "$execution" --rev "$rev" --board-id "$id" --text "$text")
+      [[ -z $verdict ]] || auto+=(--verdict "$verdict")
+      for finding in "${findings[@]}"; do auto+=(--finding "$finding"); done
+      auto_result=$("$(dirname "$0")/agent-task" _auto "$task" "$kind" "$from" "${auto[@]}" 2>/dev/null) || true
+      [[ -z $auto_result ]] || echo "$auto_result"
+    fi
+    case "$kind" in
+      finding|plan) board_event context.shared "$(jq -cn --argjson id "$id" --arg kind "$kind" '{board_id:$id,kind:$kind}')";;
+      decision) board_event decision.recorded "$(jq -cn --argjson id "$id" '{board_id:$id}')";;
+      blocker|question|ask-user) board_event agent.blocked "$(jq -cn --argjson id "$id" --arg text "$text" '{board_id:$id,reason:$text}')";;
+      done)
+        if [[ -n $execution && -n $previous && -n $rev && $auto_result != *"stale execution"* ]]; then
+          while read -r sha; do
+            [[ -n $sha ]] || continue
+            subject=$(git log -1 --format=%s "$sha")
+            board_event commit.created "$(jq -cn --arg sha "$sha" --arg branch "$branch" --arg subject "$subject" '{sha:$sha,branch:$branch,subject:$subject}')" ":$sha"
+          done < <(git rev-list --reverse "$previous..$rev" 2>/dev/null || true)
+        fi;;
+    esac
+    case "$kind" in plan|question|ask-user|blocker) echo "Now end your turn and wait; the answer will arrive as a message in this terminal.";; esac
+    ;;
+  read)
+    if [[ $last -gt 0 ]]; then lines=$(tail -n "$last" "$file"); else lines=$(tail -n +"$((after + 1))" "$file"); fi
+    [[ -z "$kfilter" || -z "$lines" ]] || lines=$(jq -c --arg k "$kfilter" 'select(.kind==$k)' <<<"$lines")
+    [[ -n "$lines" ]] || exit 0
+    if [[ $json -eq 1 ]]; then echo "$lines"
+    else echo "$lines" | jq -r '"#\(.id) \(.ts[11:16]) \(.from)\(if (.task//"") != "" then " "+.task else "" end)\(if .as != "" then "/"+.as else "" end) [\(.kind)]\(if (.re//"") != "" then " re #"+.re else "" end) → \(.to): \(.text)"'; fi
+    ;;
+  verify)
+    vf="$BUS/$project.verify"
+    [[ -f "$vf" ]] || { echo "no checks set for $project ($vf); run its lint, type-check and tests yourself" >&2; exit 2; }
+    gd=$(git rev-parse --absolute-git-dir)   # per worktree, so agents don't share stamps
+    rm -f "$gd/agent-verified"
+    cd "$(git rev-parse --show-toplevel)"
+    if clean_dev_merge "$gd/agent-verified-log"; then
+      echo "$(git rev-parse HEAD) ci" > "$gd/agent-verified"
+      echo "clean merge of a pushed branch onto verified $(git rev-parse --short HEAD^1), no overlapping files: local checks skipped."
+      echo "Push, then post done once CI is green on $(git rev-parse --short HEAD) (post done checks it)."
+      exit 0
+    fi
+    resolve_execution
+    echo "running: $(cat "$vf")"
+    if ! bash -c "$(cat "$vf")"; then
+      record_tests failed
+      echo "checks FAILED: fix them and run 'agent-msg verify' again" >&2; exit 1
+    fi
+    record_tests passed
+    git rev-parse HEAD > "$gd/agent-verified"
+    git rev-parse HEAD >> "$gd/agent-verified-log"
+    echo "checks passed on $(git rev-parse --short HEAD); you can post done"
+    ;;
+  summary)
+    jq -rs '[.[] | select(.kind|IN("answer","decision")|not)] | group_by(.from)[]
+      | {from:.[0].from, br:([.[].branch|select(.!="")]|last // ""), start:.[0].ts, l:.[-1],
+         q:([.[]|select(.kind|IN("plan","question","ask-user"))]|length)}
+      | "\(.from) \(.br) [\(.l.kind)] \(.l.ts[11:16]) asked=\(.q) mins=\((((.l.ts[0:19]+"Z")|fromdate)-((.start[0:19]+"Z")|fromdate))/60|floor) \(.l.text[0:80])"' "$file"
+    ;;
+  kinds|help|-h|--help|"") usage;;
+  *) usage >&2; exit 2;;
+esac

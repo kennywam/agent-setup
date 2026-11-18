@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# herdr-app for the coordinator on the Mini. The real one is the Mac desktop app; here a space is a
+# project folder and a tab is one hc terminal, so the rules' commands work unchanged.
+# shortcut: only ls, space.new, tab.new and tab.close; add more if the rules start using others.
+hc=$HOME/.local/bin/hc
+spaces=$HOME/coord/state/spaces.json   # {"<space>": "<folder>"}; "macbook:<folder>" for a space on the MacBook
+mkdir -p "${spaces%/*}"; [ -s "$spaces" ] || echo '{}' > "$spaces"
+opt() { local k=--$1; shift; while [ $# -gt 0 ]; do [ "$1" = "$k" ] && { printf '%s' "$2"; return; }; shift; done; }
+
+case $1 in
+  ls) # terminals Herdr placed keep their "space / tab"; ours belong to the space whose folder holds their cwd
+    "$hc" ls --json | jq --slurpfile s "$spaces" '
+      ($s[0] | to_entries) as $sp
+      | [.terminals[] | select(.state == "live") | . as $t
+         | select((.address | startswith("macbook/") and $t.where) | not) # MacBook terminals Herdr placed are not ours
+         | ((.where // "") | split(" / ")) as $w
+         | (if (.address | startswith("macbook/")) then "macbook:" + .cwd else .cwd end) as $cwd
+         | ($w[0] // ([$sp[] | select(.value as $f | ($cwd + "/") | startswith($f + "/")) ] | max_by(.value | length) | .key)) as $proj
+         | select($proj != null)
+         | {proj: $proj, tab: {id: .address, name: ($w[1] // .name // .address), terminals: [{terminal: (if (.address | contains("/")) then .address else "mac-mini/" + .address end)}]}}] as $tabs
+      | {spaces: ([$tabs[].proj] + [$sp[].key] | unique | map(. as $p
+          | {id: $p, name: $p, machine: (if ($s[0][$p] // "" | startswith("macbook:")) then "macbook" else "mac-mini" end), folder: ($s[0][$p] | if . then sub("^macbook:"; "") else null end), tabs: [$tabs[] | select(.proj == $p) | .tab]}))}' ;;
+  do)
+    cmd=$2; shift 2
+    case $cmd in
+      space.new)
+        name=$(opt name "$@"); folder=$(opt folder "$@")
+        if [ "$(opt machine "$@")" = macbook ]; then
+          "$hc" exec --on macbook -- test -d "$folder" || { echo "space.new: no folder $folder on the MacBook" >&2; exit 2; }
+          folder=macbook:$folder
+        fi
+        [ -n "$name" ] && { [[ $folder == macbook:* ]] || [ -d "$folder" ]; } || { echo "space.new needs --name and an existing --folder" >&2; exit 2; }
+        jq --arg n "$name" --arg f "$folder" '.[$n] = $f' "$spaces" > "$spaces.tmp" && mv "$spaces.tmp" "$spaces"
+        echo "$name" ;;
+      tab.new)
+        case $("$HOME/.local/bin/coord-mode" get) in suspended|draining) echo "refused: the user suspended or is turning off all work" >&2; exit 3 ;; esac
+        space=$(opt space "$@"); name=$(opt name "$@"); argv=$(opt argv "$@"); task=$(opt task "$@")
+        folder=$(jq -r --arg n "$space" '.[$n] // empty' "$spaces")
+        [ -n "$folder" ] || { echo "unknown space \"$space\": run herdr-app do space.new first" >&2; exit 2; }
+        mapfile -t a < <(jq -r '.[]' <<<"${argv:-[\"bash\"]}")
+        [ -n "$task" ] && a+=("$task")
+        # Interactive login shell, like Herdr, so the agent gets the shell's env (Claude credentials).
+        if [[ $folder == macbook:* ]]; then
+          out=$("$hc" run --on macbook --bg --json --no-parent --name "$name" --cwd "${folder#macbook:}" -- zsh -lic '"$@"' zsh "${a[@]}") || exit 1
+          jq -r .address <<<"$out"
+        else
+          out=$("$hc" run --bg --json --no-parent --name "$name" --cwd "$folder" -- bash -lic '"$@"' bash "${a[@]}") || exit 1
+          echo "mac-mini/$(jq -r .address <<<"$out")"
+        fi ;;
+      tab.close)
+        id=$(opt id "$@"); id=${id#mac-mini/} # macbook/<t> stays as is
+        [[ $id =~ ^(macbook/)?t[0-9a-z]+$ ]] || { echo "tab.close: no tab id given" >&2; exit 2; }
+        "$hc" kill "$id" >/dev/null 2>&1; "$hc" rm "$id" >/dev/null 2>&1; echo "closed $id" ;;
+      *) echo "herdr-app on the Mini supports space.new, tab.new and tab.close" >&2; exit 2 ;;
+    esac ;;
+  *) echo "herdr-app on the Mini: ls | do space.new|tab.new|tab.close" >&2; exit 2 ;;
+esac

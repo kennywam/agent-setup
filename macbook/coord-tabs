@@ -1,0 +1,35 @@
+#!/bin/bash
+# coord-tabs: show terminals the Mini coordinator starts (itself and its agents) as Herdr tabs on this
+# MacBook. They are hc terminals without a pane; each gets a tab in its project's Mini space running
+# `hc attach`, closed again when the terminal is gone. Run by launchd every minute (coord-tabs.plist).
+export PATH=$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin
+state=$HOME/.config/coord/tabs.json # {"mac-mini/t7": "<tab id>"}
+mkdir -p "${state%/*}"; [ -s "$state" ] || echo '{}' > "$state"
+herdr=$(herdr-app ls 2>/dev/null) && jq -e .spaces >/dev/null <<<"$herdr" || exit 0 # Herdr window not open
+mini=$(hc exec --on mac-mini -- bash -lc 'PATH=$HOME/coord/bin:$PATH herdr-app ls' 2>/dev/null) || exit 0
+# Terminals to show: on the Mini coordinator's list, not already in a Herdr tab, not already given one.
+want=$(jq -n -c --argjson h "$herdr" --argjson m "$mini" --slurpfile s "$state" '
+  [$h.spaces[].tabs[].terminals[].terminal | if contains("/") then . else "macbook/" + . end] as $shown  # local ids lack the prefix
+  | [$h.spaces[].tabs[].id] as $open
+  | [$m.spaces[] | .name as $p | .folder as $f | .machine as $mc | .tabs[] | {p: $p, f: $f, mc: $mc, name, t: .terminals[0].terminal}
+     | select((.t | IN($shown[])) or (($s[0][.t] // "") | IN($open[])) | not)]')  # a closed tab is reopened
+# fd 3, so herdr-app and hc in the loop can't swallow the rows; read -r keeps names with spaces whole.
+while IFS= read -r -u 3 row; do
+  p=$(jq -r .p <<<"$row") t=$(jq -r .t <<<"$row") name=$(jq -r .name <<<"$row") folder=$(jq -r .f <<<"$row")
+  # A MacBook terminal gets a tab in a local space (machine ""), a Mini one in a Mini space.
+  if [ "$(jq -r .mc <<<"$row")" = macbook ]; then mc="" id=${t#macbook/}; else mc=mac-mini id=${t#mac-mini/}; fi
+  sp=$(jq -r --arg p "$p" --arg mc "$mc" '[.spaces[] | select((.machine // "") == $mc and .name == $p) | .id][0] // empty' <<<"$herdr")
+  [ -n "$sp" ] || sp=$(herdr-app do space.new --machine "$mc" --name "$p" --folder "$folder" --focus false | jq -r .space)
+  tab=$(herdr-app do tab.new --space "$sp" --name "$name" --argv "[\"hc\",\"attach\",\"$id\"]" --focus false | jq -r .tab)
+  [ -n "$tab" ] && [ "$tab" != null ] && jq --arg t "$t" --arg v "$tab" '.[$t] = $v' "$state" > "$state.tmp" && mv "$state.tmp" "$state"
+done 3< <(jq -c '.[]' <<<"$want")
+# Close tabs whose terminal is gone.
+# Only ever pass a tab id Herdr lists right now: tab.close with an unknown or empty id closes the
+# active tab instead (it killed the user's own tab on 2026-11-19).
+for t in $(jq -r --argjson m "$mini" '[$m.spaces[].tabs[].terminals[].terminal] as $live | keys[] | select(IN($live[]) | not)' "$state"); do
+  tab=$(jq -r --arg t "$t" '.[$t] // empty' "$state")
+  if [ -n "$tab" ] && jq -e --arg id "$tab" '[.spaces[].tabs[].id] | index($id)' <<<"$herdr" >/dev/null; then
+    herdr-app do tab.close --id "$tab" --confirmed true >/dev/null 2>&1
+  fi
+  jq --arg t "$t" 'del(.[$t])' "$state" > "$state.tmp" && mv "$state.tmp" "$state"
+done

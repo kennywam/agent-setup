@@ -1,0 +1,5 @@
+#!/bin/bash
+# Status line for the coordinator: the current mode, plus plan usage when Claude reports it.
+jq -r --arg m "$("$(dirname "$0")"/coord-mode get)" '
+  $m + (if .rate_limits.five_hour then " · 5h \(.rate_limits.five_hour.used_percentage | floor)%" else "" end)
+     + (if .rate_limits.seven_day then " · 7d \(.rate_limits.seven_day.used_percentage | floor)%" else "" end)'

@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# coord-watch for the coordinator on the Mini: bash port of the MacBook's zsh coord-watch, with the
+# board read locally instead of over hc exec. Run it with run_in_background; it exits, waking the
+# coordinator, when the project's board gets a message that needs action
+# (plan/question/ask-user/blocker/review/done/stopped), when a watched agent stops or vanishes,
+# or after 60 quiet minutes (check-in).
+# Usage: [COORD_NAME=codex] coord-watch <project> <terminal>...    e.g. coord-watch project-a mac-mini/t2s
+project=$1; shift
+terms=("$@")
+coord=${COORD_NAME:-claude}
+hc=$HOME/coord/bin/hc
+bus=$HOME/.agent-bus
+state=$HOME/.local/state/coord; mkdir -p "$state"
+cursor_file=$state/$project.cursor
+[ "$coord" = claude ] || cursor_file=$state/$project.$coord.cursor
+[ -f "$cursor_file" ] || echo 0 > "$cursor_file"
+declare -A seen_working   # only count "stopped" after the agent was seen working (skips startup idle)
+
+started=$SECONDS
+while true; do
+  if (( SECONDS - started > 3600 )); then   # heartbeat: catches agents that keep "working" in a loop
+    echo "CHECK-IN ($project): no events for 60 min. Per agent, from the board:"
+    agent-msg summary --project "$project"
+    exit 0
+  fi
+  cur=$(<"$cursor_file")
+  new=$(agent-msg read --project "$project" --after "$cur" --json 2>/dev/null)
+  if [ -n "$new" ]; then
+    lastid=$(printf '%s\n' "$new" | tail -1 | jq -r .id)
+    hits=$(printf '%s\n' "$new" | jq -c 'select(.kind|test("^(plan|question|ask-user|blocker|review|done|stopped)$"))')
+    if [ -n "$hits" ] && [ -s "$bus/$project.tasks.json" ]; then   # drop what belongs to the other coordinator
+      hits=$(printf '%s\n' "$hits" | jq -c --slurpfile t "$bus/$project.tasks.json" --arg me "$coord" '
+        ([$t[0].tasks[] | select(.coordinator != $me and (.status|IN("completed","failed","cancelled")|not))]) as $other
+        | ([$other[] | .agent.terminal // empty, .reviewer.terminal // empty | sub("^.*/"; "")]) as $theirs
+        | select(((.task // "") as $k | $other | any(.id == $k)) or (.from as $f | $theirs | index($f)) | not)')
+    fi
+    echo "$lastid" > "$cursor_file"
+    if [ -n "$hits" ]; then
+      echo "BOARD ($project): new messages, some need action"
+      printf '%s\n' "$new" | jq -r '"#\(.id) \(.from)\(if .as != "" then "/"+.as else "" end) [\(.kind)]\(if (.re//"") != "" then " re #"+.re else "" end) → \(.to): \(.text)"'
+      exit 0
+    fi
+  fi
+  for t in "${terms[@]}"; do
+    info=$("$hc" get "$t" --json 2>/dev/null)
+    if [ -z "$info" ] || [ -n "$(printf '%s' "$info" | jq -r '.error // empty')" ]; then
+      echo "AGENT $t is gone (terminal not found)"; exit 0
+    fi
+    st=$(printf '%s' "$info" | jq -r '.status.state // .state // ""')
+    [ "$st" = working ] && seen_working[$t]=1
+    if [[ $st == blocked || $st == exited || $st == finished ]] || [[ $st != working && -n ${seen_working[$t]} ]]; then
+      echo "AGENT $t stopped: state=$st"
+      "$hc" read "$t" --lines 40 | grep -v '^[[:space:]]*$' | tail -20
+      exit 0
+    fi
+  done
+  # Renew our task leases, then block until the board grows past our cursor (instant wake), at most 2 min
+  # so the terminal checks above still run.
+  agent-task renew --coord "$coord" --project "$project" >/dev/null 2>&1
+  f=$bus/$project.jsonl; touch "$f"
+  [ "$(wc -l < "$f")" -gt "$(<"$cursor_file")" ] || timeout 120 inotifywait -qq -e modify "$f" >/dev/null 2>&1
+  rc=$?; (( rc == 0 || rc == 124 )) || sleep 30
+done

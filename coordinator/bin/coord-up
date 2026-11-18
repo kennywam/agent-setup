@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Start the coordinator on the Mini unless it is running (systemd timer: at boot and every 2 min).
+# It resumes its last conversation, so a crash or reboot loses nothing but the turn in flight.
+hc=$HOME/.local/bin/hc
+[ -f "$HOME/.config/coord/off" ] && exit 0 # `coord off`: stay off until `coord on`
+"$hc" get coordinator --json 2>/dev/null | jq -e '.state == "live"' >/dev/null && exit 0
+"$hc" rm coordinator >/dev/null 2>&1
+PATH=$HOME/coord/bin:$PATH herdr-app do space.new --name coordinator --folder "$HOME/coord" >/dev/null # its own Herdr space
+"$hc" run --bg --no-parent --name coordinator --cwd "$HOME/coord" -- bash -lic \
+  'export PATH=$HOME/coord/bin:$PATH COORD_NAME=claude; claude --continue || claude; exec bash -li' >/dev/null

@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Update fleet state and wake the coordinator on quiet turn ends. Hooks are always fail-open.
+case "${1:-}" in
+  _fleet|_wake) phase=$1; shift;;
+  *)
+    [[ -n ${COORD_NAME:-} ]] && exit 0 # coordinators aren't agents (the Mini coordinator sets it)
+    if [[ ${1:-} == turn-start ]]; then
+      # Printed before the silenced telemetry: Claude reads a UserPromptSubmit hook's stdout as context.
+      case $(cat "$HOME/.config/coord/mode" 2>/dev/null) in
+        suspended*) echo "[suspended] The user has SUSPENDED all agent work. Don't start or continue any work: make sure nothing is half-written, post a status saying where you stopped if you haven't, end your turn and wait for a message saying the suspension is lifted.";;
+        draining*) echo "[going off] The user is turning everything off: finish your current task (through done, or review if you are a reviewer; post a blocker if you can't), start nothing beyond it, then end your turn. You'll be closed after that.";;
+      esac
+    fi
+    input=$(cat)
+    resolved=$({ timeout --signal=KILL 0.28s bash "$0" _fleet "$@" <<<"$input"; } 2>/dev/null) || true
+    if [[ ${1:-} == turn-end ]]; then
+      # A quiet-turn wake-up is required even when optional telemetry times out.
+      { timeout --signal=KILL 3s bash "$0" _wake "$1" "$resolved" <<<"$input"; } >/dev/null 2>&1
+    fi
+    exit 0;;
+esac
+bindir=$(cd -- "$(dirname -- "$0")" && pwd)
+input=$(cat)
+python3 -S - "$bindir" "$phase" "${1:-}" "$input" "${2:-}" <<'PYHOOK'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+try:
+    _, bindir, phase, mode, raw, resolved = sys.argv
+    data = json.loads(raw)
+    terminal = os.environ.get('HC_TERMINAL_ID')
+    if not terminal or data.get('agent_id') or data.get('teammate_name'):
+        sys.exit(0)
+    if data.get('cwd'):
+        os.chdir(data['cwd'])
+    common = subprocess.check_output(['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                                     stderr=subprocess.DEVNULL, text=True).strip()
+    project = Path(common).parent.name
+    bus = Path(os.environ.get('AGENT_BUS_DIR', str(Path.home() / '.agent-bus')))
+    board = bus / f'{project}.jsonl'
+    if not board.exists() or mode not in ('turn-start', 'turn-end'):
+        sys.exit(0)
+    mark = bus / f'.turn-{project}-{terminal}'
+    lines = board.read_text().splitlines()
+    if mode == 'turn-start':
+        mark.write_text(str(len(lines)) + '\n')
+except Exception:
+    sys.exit(0)
+sys.path.insert(0, str(Path(bindir).parent / 'lib'))
+if phase == '_fleet':
+    try:
+        from agentbus import events, fleet, store
+        result = subprocess.run([os.environ.get('AGENT_BUS_HC', 'hc'), 'get', terminal, '--json'],
+                                capture_output=True, text=True, timeout=0.2)
+        info = json.loads(result.stdout) if result.returncode == 0 else {}
+        if not isinstance(info.get('created_ms'), int):
+            raise ValueError('execution unavailable')
+        xid, aid = f'mac-mini/{terminal}@{info["created_ms"]}', f'mac-mini/{terminal}'
+        print(xid, flush=True)  # Reuse the verified identity in the independent wake-up post.
+        task_id = os.environ.get('AGENT_TASK')
+        registry = store.bus_path() / f'{project}.tasks.json'
+        tasks = json.loads(registry.read_text()).get('tasks', {}) if registry.exists() else {}
+        task = tasks.get(task_id, {})
+        current = [e for e in task.get('executions', []) if not e.get('ended') and e.get('id') == xid]
+        execution = current[-1] if current else None
+        conn = store.connect()
+        conn.execute('PRAGMA busy_timeout=20')
+        with conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = fleet.get_agent(conn, xid) or {}
+            counters = json.loads(row.get('counters') or '{}')
+            now = events.now_utc()
+            state = 'working' if mode == 'turn-start' else 'idle'
+            provider = {'claude-code': 'claude', 'codex': 'codex'}.get((info.get('status') or {}).get('app'))
+            role = execution.get('role', 'worker') if execution else row.get('role', 'worker')
+            context = dict(project_id=project, task_id=task_id if execution else None,
+                           parent_task_id=task.get('parent') or None if execution else None,
+                           correlation_id=fleet.correlation(project, task, tasks) if execution else None,
+                           coordinator_id=task.get('coordinator') if execution else None,
+                           agent_id=aid, execution_id=xid, provider=provider,
+                           session_id=data.get('session_id'), source='agent-hook')
+            def record(kind, metadata):
+                counters[kind] = counters.get(kind, 0) + 1
+                store.insert_event(conn, events.build_event(kind, **context, status=state,
+                    summary=f'{aid}: {kind}', metadata=metadata,
+                    natural_key=f'agent:{xid}:{kind}:{counters[kind]}'))
+            if row.get('state') != state:
+                metadata = {'turn': info.get('turn')}
+                if state == 'idle':
+                    metadata['last_words'] = data.get('last_assistant_message') or ''
+                record('agent.busy' if state == 'working' else 'agent.idle', metadata)
+            if mode == 'turn-start' and execution:
+                if not counters.get('delegation.accepted'):
+                    record('delegation.accepted', {'role': role})
+                    earlier = [e for e in task['executions'] if e.get('role') == 'worker' and e is not execution]
+                    if role == 'worker' and earlier:
+                        record('handoff.completed', {'kind': 'context', 'from': earlier[-1]['agent_id'],
+                               'to': aid, 'brief_rev': task.get('brief_rev')})
+                if role == 'reviewer' and not counters.get('review.started'):
+                    reviews = [r for r in task.get('reviews', []) if r.get('reviewer') == aid]
+                    record('review.started', {'revision': reviews[-1].get('revision') if reviews else None})
+            fleet.upsert_agent(conn, execution_id=xid, agent_id=aid, provider=provider, role=role,
+                machine_id='mac-mini', project_id=project, task_id=task_id if execution else None,
+                coordinator_id=task.get('coordinator') if execution else None,
+                session_id=data.get('session_id') or row.get('session_id'), state=state,
+                hook_at=now if state == 'working' else None, last_activity_at=now,
+                last_heartbeat_at=now, counters=json.dumps(counters))
+        conn.close()
+    except Exception as error:
+        try:
+            events.log_error(error)
+        except Exception:
+            pass  # Even telemetry failure logging must be fail-open.
+# Preserve the original wake-up when a turn ended without an actionable board post.
+try:
+    if phase == '_wake' and mode == 'turn-end':
+        start = int(mark.read_text()) if mark.exists() else 0
+        actionable = {'plan', 'question', 'ask-user', 'blocker', 'review', 'done'}
+        posted = False
+        for line in lines[start:]:
+            post = json.loads(line)
+            if post.get('from') == terminal and post.get('kind') in actionable:
+                posted = True
+                break
+        if not posted:
+            last = data.get('last_assistant_message') or ''
+            transcript = data.get('transcript_path')
+            if not last and transcript and Path(transcript).is_file():
+                for line in Path(transcript).read_text().splitlines()[-50:]:
+                    post = json.loads(line)
+                    if post.get('type') == 'assistant':
+                        for part in post.get('message', {}).get('content', []):
+                            if part.get('type') == 'text':
+                                last = part.get('text', '')
+            last = last.replace('\n', ' ')[:400] or '(none)'
+            subprocess.run([str(Path(bindir) / 'agent-msg'), 'post', 'stopped',
+                f'turn ended without a board post. Last words: {last}', '--project', project,
+                '--exec', resolved],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        mark.write_text(str(len(board.read_text().splitlines())) + '\n')
+except Exception:
+    pass
+
+PYHOOK
+exit 0

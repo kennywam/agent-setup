@@ -1,0 +1,21 @@
+#!/bin/bash
+# coord-push: install or update the Mini coordinator from this MacBook. Run it from the agent-bus checkout
+# (./macbook/coord-push): it ships this checkout's Mini side (install.sh mini) plus your own rules and
+# delegate skill, which become ~/coord/rules.md and ~/coord/.claude/skills/delegate on the Mini.
+# It never enables or starts the coordinator; see docs/mini-coordinator.md.
+#   COORD_RULES  your coordination rules (default ~/projects/CLAUDE.md, from docs/templates)
+#   COORD_SKILL  your delegate skill (default ~/.claude/skills/delegate/SKILL.md)
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
+rules=${COORD_RULES:-$HOME/projects/CLAUDE.md} skill=${COORD_SKILL:-$HOME/.claude/skills/delegate/SKILL.md}
+stage=$(mktemp -d); trap 'rm -rf "$stage"' EXIT
+mkdir -p "$stage/rules"
+mini_paths() { sed -e 's|~/projects/CLAUDE.md|~/coord/rules.md|g' -e 's|~/.claude/skills/delegate|~/coord/.claude/skills/delegate|g'; }
+mini_paths < "$rules" > "$stage/rules/rules.md"
+mini_paths < "$skill" > "$stage/rules/SKILL.md"
+COPYFILE_DISABLE=1 tar --no-xattrs --exclude __pycache__ -C "$repo" -cf - install.sh lib bin coordinator systemd -C "$stage" rules |
+  "$HOME/.local/bin/hc" exec -i --on mac-mini -- bash -lc 'set -e; d=$(mktemp -d); trap "rm -rf \"$d\"" EXIT
+    tar -C "$d" -xf -; "$d/install.sh" mini
+    install -D -m 644 "$d/rules/rules.md" ~/coord/rules.md
+    install -D -m 644 "$d/rules/SKILL.md" ~/coord/.claude/skills/delegate/SKILL.md
+    systemctl --user daemon-reload; ls ~/coord ~/coord/bin'

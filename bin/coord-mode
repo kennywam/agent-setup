@@ -1,0 +1,293 @@
+#!/bin/bash
+# coord-mode: the coordinator's operating mode: interactive, autonomous or suspended (plus draining,
+# while `coord off` waits for agents to finish their current task).
+# Policy: "Operating modes" in the coordination rules. The user runs it as `coord` (no Claude needed):
+#   coord status | interactive | autonomous | suspend [now] | resume [interactive|autonomous] | off [now] | on
+# Claude also uses: get | set <mode> | log "<text>" | count <project> | due <job> <secs> | brief | tick | hook
+export LC_ALL=C
+dir=$HOME/.config/coord
+mode_file=$dir/mode log_file=$dir/activity.log queue=$dir/away.md stood=$dir/stood-down offf=$dir/off drainf=$dir/draining
+activity=$dir/last-activity checkin=$dir/last-checkin pidf=$dir/tick.pid awakef=$dir/caffeinate.pid
+who=${COORD_NAME:-claude}; [ "${0##*/}" = coord ] && who=${COORD_NAME:-user}
+rules=${COORD_RULES:-'~/projects/CLAUDE.md'}; [ -f "$HOME/coord/rules.md" ] && rules='~/coord/rules.md' # MacBook or Mini
+hc=$HOME/.local/bin/hc
+mkdir -p "$dir"
+IDLE_SECS=2700 CHECKIN_SECS=1800 # 45 min without a user message; 30 min between check-ins
+DRAIN_IDLE_SECS=2700 # coord off: an agent idle this long without done/review/blocker counts as finished (stuck)
+
+raw() { cat "$mode_file" 2>/dev/null; } # interactive | autonomous [idle] | suspended <before> | draining <before>
+get() { case $(raw) in suspended*) echo suspended ;; draining*) echo draining ;; autonomous*) echo autonomous ;; *) echo interactive ;; esac; }
+log() { printf '%s %s: %s\n' "$(date +%Y-%m-%dT%H:%M%z)" "$who" "$*" >> "$log_file"; }
+upper() { echo "$1" | tr a-z A-Z; }
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; } # Linux, then macOS
+age() { echo $(( $(date +%s) - $(mtime "$1") )); }
+
+# Keep the Mac awake while autonomous (caffeinate can't stop lid-close sleep without an external display).
+keep_awake() {
+  command -v caffeinate >/dev/null || return 0 # the Mini never sleeps
+  local pid; pid=$(cat "$awakef" 2>/dev/null)
+  if [ "$(get)" = autonomous ]; then
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || { nohup caffeinate -is >/dev/null 2>&1 & echo $! > "$awakef"; }
+  elif [ -n "$pid" ]; then kill "$pid" 2>/dev/null; rm -f "$awakef"
+  fi
+}
+
+# set_raw <state>. Prints "switched" or "unchanged". The lock makes check-and-set atomic, so one switch
+# never runs twice. "suspended" and "draining" keep the mode before them, for resume.
+set_raw() {
+  local new=$1 old base n=0
+  until mkdir "$mode_file.lock" 2>/dev/null || [ $((n++)) -ge 30 ]; do sleep 0.1; done
+  old=$(raw); old=${old:-interactive}
+  base=${old#suspended }; base=${base#draining }
+  case $new in suspended|draining) new="$new $base" ;; esac
+  if [ "$old" = "$new" ]; then echo unchanged
+  else
+    echo "$new" > "$mode_file.tmp" && mv "$mode_file.tmp" "$mode_file" && log "mode $old -> $new" && echo switched
+    [ "${new%% *}" = autonomous ] && touch "$checkin" # the switch itself is the first check-in
+  fi
+  rmdir "$mode_file.lock" 2>/dev/null
+  keep_awake
+}
+set_mode() { set_raw "$1${2:+ $2}"; }
+
+# Agent CLIs the coordinator runs: live claude/codex terminals on the Mini, and on the MacBook those it
+# started (no Herdr placement). Not the coordinator, not `hc attach` viewer tabs.
+agents() {
+  "$hc" ls --json 2>/dev/null | jq -r '.terminals[] | select(.state == "live" and (.agent | IN("claude-code", "codex"))
+      and .name != "coordinator" and ((.address | contains("/") | not) or ((.address | startswith("macbook/")) and (.where | not))))
+    | .address' | while read -r t; do
+    [ "$t" = "${HC_TERMINAL_ID:-}" ] && continue
+    "$hc" get "$t" --json 2>/dev/null | jq -e 'all((.argv // []), (.foreground.argv // []); . as $a  # a Herdr viewer tab: a shell running hc attach
+      | [range(0; ($a | length) - 1) | select(($a[.] | endswith("hc")) and $a[. + 1] == "attach")] | length == 0)' >/dev/null && echo "$t"
+  done
+}
+# Only type into an agent whose input line is empty: the user may be typing there.
+input_empty() { "$hc" read "$1" --lines 15 2>/dev/null | grep '^❯' | tail -1 | grep -qE '^❯[[:space:]]*$'; }
+tell() { # tell <terminal> <text>: prints what happened
+  if input_empty "$1"; then "$hc" send "$1" "$2" >/dev/null 2>&1 && echo "told $1" || echo "could not reach $1"
+  else echo "NOT told $1: its input line isn't empty (someone may be typing there)"; fi
+}
+
+stand_down_msg="STAND DOWN: the user has suspended all agent work. Don't start any new step. Finish only what keeps your work safe (no half-written files; leave uncommitted work in your worktree rather than committing it just to stop), post a status on the board saying exactly where you stopped, then end your turn and wait. Don't continue until a message says the suspension is lifted."
+drain_msg="FINISH AND STOP: the user is turning everything off. Finish your current task (through posting done, or review if you are a reviewer; if you can't, post a blocker), but start nothing beyond it. Then end your turn: you'll be closed after that."
+drain_cancel_msg="OFF CANCELLED: the user changed their mind. Carry on as normal."
+resume_msg="SUSPENSION LIFTED: continue where you left off. First run agent-task show \$AGENT_TASK if you have a task, and read the board for anything posted while you were stopped, so nothing is done twice."
+
+do_suspend() { # do_suspend [now]
+  local r; r=$(set_raw suspended)
+  [ "$r" = unchanged ] && { echo "Already suspended."; return; }
+  stand_down "$1"
+  echo "SUSPENDED. Agents are stopping; \`coord status\` shows when all have stopped."
+}
+stand_down() { # stand_down [now]: tell every agent to stop (the state is already suspended)
+  : > "$stood"
+  for t in $(agents); do
+    [ "$1" = now ] && "$hc" interrupt "$t" >/dev/null 2>&1
+    tell "$t" "$stand_down_msg"; echo "$t" >> "$stood"
+  done
+  log "suspend${1:+ $1}: stood down $(tr '\n' ' ' < "$stood")"
+}
+do_resume() { # do_resume [interactive|autonomous]
+  local old; old=$(raw)
+  [[ $old == suspended* ]] || { echo "Not suspended: nothing to resume."; return 1; }
+  local to=${1:-${old#suspended }}
+  [ "$(set_raw "$to")" = switched ] || { echo "Could not resume."; return 1; }
+  local live; live=$(agents)
+  for t in $(cat "$stood" 2>/dev/null); do grep -qx "$t" <<<"$live" && tell "$t" "$resume_msg"; done
+  rm -f "$stood"
+  echo "Resumed: mode is $(upper "$(get)")."
+}
+status() {
+  echo "Mode: $(upper "$(get)")$( [ "$(get)" = suspended ] && echo " (resume returns to: $(raw | cut -d' ' -f2-))")"
+  local n=0 c s
+  c=$("$hc" get coordinator --json 2>/dev/null | jq -r '"\(.address) (\(.status.state // .state))"')
+  if [ -f "$drainf" ]; then echo "Coordinator: ${c:-not running}, going OFF once these finish: $(tr '\n' ' ' < "$drainf")(coord on cancels)"
+  elif [ -f "$offf" ]; then echo "Coordinator: OFF${c:+, still stopping: $c}  (coord on)"
+  else echo "Coordinator: ${c:-not running}  (attach coord)"; fi
+  echo "Agents:"
+  for t in $(agents); do # "t160  working  project-a / fix-login": state, then the Herdr tab or terminal name
+    s=$("$hc" get "$t" --json 2>/dev/null | jq -r '"\(.status.state // .state)\t\(.labels.where // .name // "")"')
+    printf '  %-12s %-8s %s\n' "$t" "${s%%$'\t'*}" "${s#*$'\t'}"; [ "${s%%$'\t'*}" = working ] && n=$((n + 1))
+  done
+  if [ "$(get)" = suspended ]; then
+    [ $n -eq 0 ] && echo "Suspension is fully effective: no agent is working." || echo "Suspension in progress: $n agent(s) still working."
+  fi
+}
+# Stop everything: agents, the drain, then the coordinator, and keep it off (timer disabled, coord-up refuses).
+shutdown() {
+  set_raw suspended >/dev/null; rm -f "$drainf" "$stood"; touch "$offf"
+  for t in $(agents); do "$hc" kill "$t" >/dev/null 2>&1; "$hc" rm "$t" >/dev/null 2>&1; done
+  systemctl --user disable --now coord-up.timer >/dev/null 2>&1
+  log "coordinator off"
+  echo "OFF: agents and coordinator stopped. Nothing starts again (not the timer, not a reboot) until \`coord on\`."
+  "$hc" kill coord-drain >/dev/null 2>&1 # when the drain itself calls this, it ends here; rm it
+  "$hc" kill coordinator >/dev/null 2>&1; sleep 2; "$hc" rm coordinator >/dev/null 2>&1
+}
+# Tell the coordinator about a change the user made outside its chat (no-op when it made the change).
+nudge_coordinator() {
+  [ "$who" = user ] || return 0
+  "$hc" get coordinator --json >/dev/null 2>&1 && tell coordinator "[coord] $1" >/dev/null
+}
+
+# Mode command in a message whose first line starts with a mode phrase followed by punctuation or nothing.
+# "take over the login bug" and "resume the billing work" are tasks, not switches.
+match() {
+  local s end="([[:punct:]]|[[:space:]]*$)"
+  s=$(printf '%s\n' "$1" | head -n1 | sed -e "s/$(printf '\342\200\231')/'/g" -e 's/^[[:space:]]*//' | tr A-Z a-z)
+  local to_i="^(interactive( mode)?|switch to interactive( mode)?|i'?m back|i am back|i'?m available|i am available|let'?s collaborate)"
+  local to_a="^(autonomous( mode)?|switch to autonomous( mode)?|i'?m away|i am away|i'?m going to sleep|i am going to sleep|good ?night|take over)"
+  local to_s="^(suspend|suspended|pause all|stand down|stop agents|switch to suspended)( now)?"
+  local to_r="^(resume|unsuspend|continue agents|lift suspension)( (interactive|autonomous))?"
+  if [[ $s =~ $to_s$end ]]; then echo "suspend${BASH_REMATCH[2]:+ now}"
+  elif [[ $s =~ $to_r$end ]]; then echo "resume${BASH_REMATCH[3]:+ ${BASH_REMATCH[3]}}"
+  elif [[ $s =~ $to_i$end ]]; then echo interactive
+  elif [[ $s =~ $to_a$end ]]; then echo autonomous; fi
+}
+
+briefing_msg="[coord-mode] Switched to INTERACTIVE. Before anything else, give the Return Briefing (\"Operating modes\" in $rules) from \`coord-mode brief\`."
+auto_msg="Follow \"Operating modes\" in $rules and run a check-in now."
+suspended_msg="[coord-mode] SUSPENDED by the user: don't start, continue or schedule any work (no agents, reviewers, merges, nudges, check-ins). Answer questions and report status only (\`coord-mode status\`)."
+draining_msg="[coord-mode] DRAINING: the user is turning everything off. Help the agents' current tasks reach done (answer questions, approve plans, nudge stalled agents), but start nothing new: no agents, reviewers, merges or queue. Agents and you are stopped automatically when they finish. Mode commands wait: \`coord on\` cancels the off, \`coord off now\` stops at once."
+resumed_msg="Give the user a brief suspension summary (what stopped, what is resuming, anything needing attention), make sure the pacer and your watchers run, then carry on in the restored mode."
+
+case $1 in
+  get) get ;;
+  status) status ;;
+  set|interactive|autonomous)
+    m=$1; [ "$m" = set ] && m=$2
+    case $m in interactive|autonomous) ;; *) echo "usage: coord-mode set interactive|autonomous" >&2; exit 2 ;; esac
+    [ "$(get)" = suspended ] && { echo "Suspended: \`coord resume $m\` lifts it and switches." >&2; exit 3; }
+    [ "$(get)" = draining ] && { echo "Going off: \`coord on\` cancels that first." >&2; exit 3; }
+    r=$(set_mode "$m"); echo "$r"; [ "$r" = switched ] && nudge_coordinator "The user switched the mode to $(upper "$m")." ;;
+  suspend)
+    [ "$(get)" = draining ] && { echo "Going off already: \`coord off now\` stops at once, \`coord on\` cancels." >&2; exit 3; }
+    do_suspend "$2" && nudge_coordinator "The user SUSPENDED all work. Don't start or continue anything; report which agents are still stopping (coord-mode status)." ;;
+  resume)
+    case ${2:-} in ""|interactive|autonomous) ;; *) echo "usage: coord resume [interactive|autonomous]" >&2; exit 2 ;; esac
+    do_resume "$2" && nudge_coordinator "The user lifted the suspension; mode is $(upper "$(get)"). $resumed_msg" ;;
+  off) # off: agents finish their current task, then everything stops. off now: stop everything at once.
+    command -v systemctl >/dev/null || { echo "coord off runs on the Mini (the MacBook's coord forwards there)" >&2; exit 2; }
+    [ -f "$offf" ] && [ ! -f "$drainf" ] && { echo "Already off."; exit 0; }
+    if [ "$2" = now ] || [ "$(get)" = suspended ]; then shutdown; exit 0; fi # suspended agents are already stopped
+    [ -f "$drainf" ] && { echo "Already going off; \`coord off now\` stops at once."; exit 0; }
+    set_raw draining >/dev/null; touch "$offf"; agents > "$drainf"; log "off: draining $(tr '\n' ' ' < "$drainf")"
+    for t in $(cat "$drainf"); do tell "$t" "$drain_msg"; done
+    nudge_coordinator "The user is turning everything off. DRAINING: help the agents' current tasks reach done (answer questions, approve plans, nudge stalled agents); start nothing new (no agents, reviewers, merges, queue). Everything stops automatically when they finish."
+    "$hc" run --bg --no-parent --name coord-drain -- bash -lc "$HOME/.local/bin/coord-mode drain" >/dev/null
+    if [ -s "$drainf" ]; then echo "Going OFF: agents finish their current task first; then they and the coordinator stop. \`coord status\` shows progress; \`coord on\` cancels; \`coord off now\` stops at once."
+    else echo "No agents running: going OFF now."; fi ;;
+  drain) # the coord-drain terminal: close each agent once it finished its task, then shut down
+    since=$(date +%s); declare -A idle
+    while [ -f "$drainf" ]; do
+      for t in $(cat "$drainf"); do
+        st=$("$hc" get "$t" --json 2>/dev/null | jq -r 'if .state == "live" then (.status.state // "idle") else "gone" end')
+        done_=
+        case $st in
+          ""|gone) done_="its terminal ended" ;;
+          working) unset "idle[$t]" ;;
+          *) last=$(cat "$HOME"/.agent-bus/*.jsonl 2>/dev/null | jq -r --arg t "$t" 'select(.from == $t and (.kind | IN("plan","question","ask-user","blocker","review","done"))) | .kind' | tail -1)
+             case $last in done|review|blocker) done_="posted $last" ;; esac
+             : "${idle[$t]:=$(date +%s)}"
+             [ -z "$done_" ] && [ $(( $(date +%s) - ${idle[$t]} )) -ge $DRAIN_IDLE_SECS ] && done_="idle $((DRAIN_IDLE_SECS / 60)) min without finishing" ;;
+        esac
+        if [ -n "$done_" ]; then
+          "$hc" kill "$t" >/dev/null 2>&1; "$hc" rm "$t" >/dev/null 2>&1
+          grep -vx "$t" "$drainf" > "$drainf.tmp"; mv "$drainf.tmp" "$drainf"; log "off: closed $t ($done_)"
+        fi
+      done
+      [ -s "$drainf" ] || { shutdown; exit 0; }
+      sleep 60
+    done ;; # coord on cancelled the drain
+  on) # start the coordinator again and lift the suspension; while going off, cancel that instead
+    command -v systemctl >/dev/null || { echo "coord on runs on the Mini (the MacBook's coord forwards there)" >&2; exit 2; }
+    [ -f "$offf" ] || { echo "The coordinator isn't off."; exit 0; }
+    if [ -f "$drainf" ]; then
+      for t in $(cat "$drainf"); do tell "$t" "$drain_cancel_msg" >/dev/null; done
+      rm -f "$drainf" "$offf"; "$hc" kill coord-drain >/dev/null 2>&1; "$hc" rm coord-drain >/dev/null 2>&1
+      set_raw "$(raw | cut -d' ' -f2-)" >/dev/null; log "off cancelled"
+      nudge_coordinator "The user cancelled the off; mode is $(upper "$(get)"). Carry on as normal."
+      echo "Off cancelled: mode is $(upper "$(get)")."; exit 0
+    fi
+    rm -f "$offf"; log "coordinator on"
+    systemctl --user enable --now coord-up.timer >/dev/null 2>&1; systemctl --user start coord-up.service
+    for _ in $(seq 30); do # wait for Claude to be ready for input, so the resume notice reaches it
+      [ "$("$hc" get coordinator --json 2>/dev/null | jq -r '.status.state // empty')" = idle ] && break; sleep 2
+    done
+    echo "Coordinator ON: $("$hc" get coordinator --json 2>/dev/null | jq -r .address)."
+    if [ "$(get)" = suspended ]; then do_resume "$2" && nudge_coordinator "The user turned you back on and lifted the suspension; mode is $(upper "$(get)"). $resumed_msg"; fi ;;
+  stand-down) stand_down "$2" ;; # hook helper, run in the background
+  log) shift; log "$*" ;;
+  count) # agent tasks started today for a project, logged as "started <project>: ..."
+    [ -n "$2" ] || { echo "usage: coord-mode count <project>" >&2; exit 2; }
+    grep -c "^$(date +%F)T.*: started $2: " "$log_file" 2>/dev/null || true ;;
+  due) # due <job> <secs>: prints "due" and restarts the clock when <job> last ran <secs> or more ago
+    [ -n "$2" ] && [ -n "$3" ] || { echo "usage: coord-mode due <job> <secs>" >&2; exit 2; }
+    mkdir -p "$dir/due"
+    if [ "$(age "$dir/due/$2")" -ge "$3" ]; then touch "$dir/due/$2"; echo due; else echo "not due"; fi ;;
+  brief)
+    cat "$queue" 2>/dev/null
+    echo; echo "## Activity since the last switch to autonomous"
+    awk '/: mode [a-z]+ -> autonomous( idle)?$/ {n = NR} {l[NR] = $0} END {for (i = n + 1; i <= NR; i++) print l[i]}' "$log_file" 2>/dev/null ;;
+  tick) # pacer: run in the background; it exits (waking the coordinator) when there is something to do
+    if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then echo "Pacer already running (pid $(cat "$pidf")). Nothing to do."; exit 0; fi
+    echo $$ > "$pidf"; trap 'rm -f "$pidf"' EXIT
+    [ -f "$activity" ] || touch "$activity"
+    while sleep 60; do
+      keep_awake
+      case $(get) in
+        suspended|draining) ;; # no takeover, no check-ins
+        interactive)
+          if [ "$(age "$activity")" -ge $IDLE_SECS ] && [ "$(set_mode autonomous idle)" = switched ]; then
+            echo "[coord-mode] No message from the user for 45 min: switched to AUTONOMOUS (idle). $auto_msg Then restart the pacer."; exit 0
+          fi ;;
+        autonomous)
+          if [ "$(age "$checkin")" -ge $CHECKIN_SECS ]; then
+            touch "$checkin"; echo "[coord-mode] Autonomous check-in due. $auto_msg Then restart the pacer."; exit 0
+          fi ;;
+      esac
+    done ;;
+  hook) # UserPromptSubmit and SessionStart hook for Claude and Codex
+    input=$(cat)
+    event=$(printf '%s' "$input" | jq -r '.hook_event_name // "UserPromptSubmit"' 2>/dev/null)
+    "$0" hook-text "$input" | jq -Rs --arg e "$event" '{hookSpecificOutput: {hookEventName: $e, additionalContext: .}}'
+    exit 0 ;;
+  hook-text)
+    input=$2
+    prompt=$(printf '%s' "$input" | jq -r '.prompt // empty' 2>/dev/null)
+    event=$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null)
+    touch "$activity"
+    m=$(get)
+    if [ "$event" = SessionStart ]; then
+      echo "[coord-mode] Current mode: $(upper "$m")."
+      [ "$m" = suspended ] && echo "$suspended_msg"
+      [ "$m" = draining ] && echo "$draining_msg"
+      [ "$who" = claude ] && echo "[coord-mode] Start the pacer: \`coord-mode tick\` in the background (Bash run_in_background). It does nothing while suspended."
+      exit 0
+    fi
+    new=$(match "$prompt")
+    [ "$m" = draining ] && { echo "$draining_msg"; exit 0; }
+    case $new in
+      suspend*)
+        if [ "$m" = suspended ]; then echo "[coord-mode] Already SUSPENDED. Report \`coord-mode status\`."
+        else set_raw suspended >/dev/null; nohup "$0" stand-down ${new#suspend} >/dev/null 2>&1 &
+          echo "$suspended_msg Agents are being told to stand down now. Acknowledge in one line, then report \`coord-mode status\` (which agents are still stopping)."; fi ;;
+      resume*)
+        if [ "$m" != suspended ]; then echo "[coord-mode] Not suspended, so \"${prompt%%$'\n'*}\" changes nothing: treat the message as normal. Mode: $(upper "$m")."
+        else do_resume ${new#resume} >/dev/null; echo "[coord-mode] Suspension lifted; mode is $(upper "$(get)"). $resumed_msg"; fi ;;
+      interactive|autonomous)
+        if [ "$m" = suspended ]; then echo "[coord-mode] Still SUSPENDED: mode switches wait until the user says \"resume\" (or \"resume $new\"). Say so in one line."
+        elif [ "$(set_mode "$new")" = unchanged ]; then echo "[coord-mode] Already $(upper "$new"), nothing switched. Say so in one line."
+        elif [ "$new" = autonomous ]; then echo "[coord-mode] Switched to AUTONOMOUS. Acknowledge in one line. $auto_msg"
+        else echo "$briefing_msg"; fi ;;
+      *)
+        # Any message ends an idle takeover; one the user started stays until they switch back.
+        if [ "$(raw)" = "autonomous idle" ] && [ "$(set_mode interactive)" = switched ]; then echo "$briefing_msg"
+        elif [ "$m" = suspended ]; then echo "$suspended_msg"
+        else echo "[coord-mode] Current mode: $(upper "$m")."
+          [ "$m" = autonomous ] && echo "[coord-mode] The user sent this, so answer it; stay autonomous unless they switch."
+        fi ;;
+    esac
+    exit 0 ;;
+  *) echo "usage: coord status | interactive | autonomous | suspend [now] | resume [interactive|autonomous] | off [now] | on" >&2
+     echo "       coord-mode get | set <mode> | log \"<text>\" | count <project> | due <job> <secs> | brief | tick | hook" >&2; exit 2 ;;
+esac

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# macbook-capacity: may the Mini coordinator start one more light agent on the MacBook?
+# Prints ALLOW (exit 0) or DEFER: <why> (exit 1). Rules: "MacBook overflow" in ~/coord/CLAUDE.md (docs/macbook-overflow.md).
+hc=$HOME/.local/bin/hc
+MAX_AGENTS=2 MIN_FREE=30   # MIN_FREE: macOS "memory free percentage"; below it the user's own work suffers
+state=$("$hc" machine ls --json | jq -r '.machines[] | select(.name == "macbook") | .state')
+[ "$state" = connected ] || { echo "DEFER: MacBook not reachable ($state)"; exit 1; }
+n=$("$hc" ls --json | jq '[.terminals[] | select((.address | startswith("macbook/")) and .state == "live" and (.agent | IN("claude-code", "codex")) and (.where | not))] | length')
+[ "$n" -lt $MAX_AGENTS ] || { echo "DEFER: $n coordinator agents already on the MacBook (max $MAX_AGENTS)"; exit 1; }
+free=$("$hc" exec --on macbook -- memory_pressure -Q 2>/dev/null | grep -oE '[0-9]+%' | tr -d %)
+[ -n "$free" ] && [ "$free" -ge $MIN_FREE ] || { echo "DEFER: MacBook memory free ${free:-unknown}% (need $MIN_FREE%)"; exit 1; }
+echo "ALLOW: $n agents running, ${free}% memory free"

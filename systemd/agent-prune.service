@@ -1,0 +1,6 @@
+[Unit]
+Description=Prune retained agent-bus audit events
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agent-event prune --days 180

@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""agent-capacity: may a coordinator start another agent on this machine now? (Linux; the Mac mini)
+
+Decides from measured pressure, not load average:
+  memory  MemAvailable, memory PSI (full avg60)      - can a new agent fit without swapping
+  cpu     CPU PSI (some avg60 and avg10)             - are runnable tasks already waiting for CPU
+  io      IO PSI (full avg60)                        - is the disk the bottleneck
+  agents  live agent CLIs (hc ls: .status.app set)   - bounded concurrency
+  stagger agents started in the last STAGGER minutes - never start two at once
+
+Classes: light = an agent that edits code and runs unit tests/lint; heavy = it will also build, run
+servers, Docker stacks or e2e (those still need `server-turn` as before).
+
+Usage: agent-capacity [--class light|heavy] [--json] [--record --project P [--task T] [--as COORD]]
+Exit: 0 start allowed, 3 not now (reasons printed), 2 usage error.
+--record posts the decision to the project board (and to the event store once agent-event exists).
+"""
+import argparse, json, os, shutil, subprocess, sys, time
+
+LIMITS = {   # shortcut: fixed thresholds for the 4-core/16 GB Mini; make them per-host config if a host is added
+    "light": {"mem_avail_gb": 3.0, "mem_full60": 5.0, "cpu_some60": 60.0, "cpu_some10": 80.0, "io_full60": 10.0},
+    "heavy": {"mem_avail_gb": 7.0, "mem_full60": 2.0, "cpu_some60": 30.0, "cpu_some10": 50.0, "io_full60": 5.0},
+}
+MAX_AGENTS = int(os.environ.get("AGENT_MAX_AGENTS", "8"))   # all agent CLIs on the machine, any project
+STAGGER_MIN = float(os.environ.get("AGENT_STAGGER_MIN", "3"))
+HC = os.environ.get("AGENT_BUS_HC", "hc")
+AGENT_APPS = ("claude-code", "codex")
+
+
+def psi(resource):
+    out = {}
+    try:
+        for line in open(f"/proc/pressure/{resource}"):
+            kind, *fields = line.split()
+            out[kind] = {k: float(v) for k, v in (f.split("=") for f in fields) if k != "total"}
+    except OSError:
+        pass
+    return out
+
+
+def meminfo():
+    vals = {}
+    for line in open("/proc/meminfo"):
+        k, v = line.split(":")
+        vals[k] = int(v.split()[0]) * 1024
+    return vals
+
+
+def agents():
+    """Live agent CLIs as Herdr sees them; a terminal without .status.app is just a shell."""
+    if not shutil.which(HC):
+        return None
+    try:
+        raw = subprocess.run([HC, "ls", "--json"], capture_output=True, text=True, timeout=20).stdout
+        data = json.loads(raw)
+    except (subprocess.SubprocessError, ValueError):
+        return None
+    terms = data.get("terminals", data) if isinstance(data, dict) else data
+    # `hc ls` shape: {address, agent: claude-code|codex|bash|..., state: live|finished, status: "working"|"done"|...}
+    # Only this machine's terminals ("macbook/t3" lives elsewhere).
+    cand = [t for t in terms if isinstance(t, dict) and t.get("state") == "live" and t.get("agent") in AGENT_APPS
+            and "/" not in t.get("address", "")]
+    live, recent, now_ms = [], [], time.time() * 1000
+    for t in cand:   # argv and start time are only in `hc get`
+        try:
+            info = json.loads(subprocess.run([HC, "get", t["address"], "--json"], capture_output=True, text=True,
+                                             timeout=10).stdout)
+        except (subprocess.SubprocessError, ValueError):
+            info = {}
+        # A Herdr tab running `hc attach <t>` reports the agent it shows, but it's only a viewer.
+        # The tab is a shell (argv) running hc in the foreground, so check both.
+        if any(any(a.endswith("hc") and b == "attach" for a, b in zip(argv, argv[1:]))
+               for argv in (info.get("argv") or [], (info.get("foreground") or {}).get("argv") or [])):
+            continue
+        live.append(t)
+        if now_ms - (info.get("created_ms") or 0) < STAGGER_MIN * 60000:
+            recent.append(t["address"])
+    return {"live": len(live), "recent": recent, "working": sum(1 for t in live if t.get("status") == "working")}
+
+
+def assess(cls):
+    lim = LIMITS[cls]
+    mi, cpu, mem, io = meminfo(), psi("cpu"), psi("memory"), psi("io")
+    m = {
+        "mem_avail_gb": round(mi["MemAvailable"] / 2**30, 2),
+        "swap_used_gb": round((mi["SwapTotal"] - mi["SwapFree"]) / 2**30, 2),
+        "mem_full60": mem.get("full", {}).get("avg60", 0.0),
+        "cpu_some10": cpu.get("some", {}).get("avg10", 0.0),
+        "cpu_some60": cpu.get("some", {}).get("avg60", 0.0),
+        "io_full60": io.get("full", {}).get("avg60", 0.0),
+        "load1": os.getloadavg()[0],
+        "cores": os.cpu_count(),
+    }
+    reasons = []
+    if m["mem_avail_gb"] < lim["mem_avail_gb"]:
+        reasons.append(f"memory: {m['mem_avail_gb']} GB available < {lim['mem_avail_gb']} GB")
+    if m["mem_full60"] > lim["mem_full60"]:
+        reasons.append(f"memory pressure: full avg60 {m['mem_full60']}% > {lim['mem_full60']}%")
+    if m["cpu_some60"] > lim["cpu_some60"] or m["cpu_some10"] > lim["cpu_some10"]:
+        reasons.append(f"cpu pressure: some avg10 {m['cpu_some10']}%, avg60 {m['cpu_some60']}% "
+                       f"(limits {lim['cpu_some10']}%/{lim['cpu_some60']}%)")
+    if m["io_full60"] > lim["io_full60"]:
+        reasons.append(f"io pressure: full avg60 {m['io_full60']}% > {lim['io_full60']}%")
+    # The user's suspension (coord suspend) blocks every start; an unreadable mode file blocks too (fail closed).
+    try:
+        mode = open(os.path.expanduser("~/.config/coord/mode")).read().strip()
+    except FileNotFoundError:
+        mode = "interactive"
+    except OSError:
+        mode = "suspended (mode file unreadable)"
+    if mode.startswith(("suspended", "draining")):
+        reasons.append(f"{mode.split()[0]} (the user's `coord suspend` or `coord off`): no agent starts")
+    a = agents()
+    if a is None:
+        reasons.append("agents: hc unavailable, cannot count running agents")
+    else:
+        m.update({"agents_live": a["live"], "agents_working": a["working"], "agents_recent": a["recent"]})
+        if a["live"] >= MAX_AGENTS:
+            reasons.append(f"concurrency: {a['live']} agents live >= cap {MAX_AGENTS}")
+        if a["recent"]:
+            reasons.append(f"stagger: {', '.join(a['recent'])} started < {STAGGER_MIN:g} min ago")
+    return {"class": cls, "allow": not reasons, "reasons": reasons, "metrics": m,
+            "limits": dict(lim, max_agents=MAX_AGENTS, stagger_min=STAGGER_MIN),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def record(d, project, task, coord):
+    m = d["metrics"]
+    verdict = "ALLOW" if d["allow"] else "DEFER"
+    text = (f"SCHEDULING {verdict} {d['class']} agent: mem {m['mem_avail_gb']}G avail (swap {m['swap_used_gb']}G), "
+            f"cpu psi {m['cpu_some10']}/{m['cpu_some60']}%, io psi {m['io_full60']}%, "
+            f"agents {m.get('agents_live', '?')}/{MAX_AGENTS}, load {m['load1']:.1f}"
+            + (f". Reasons: {'; '.join(d['reasons'])}" if d["reasons"] else ""))
+    cmd = ["agent-msg", "post", "status", text, "--project", project, "--as", coord]
+    if task:
+        cmd += ["--task", task]
+    subprocess.run(cmd, capture_output=True, timeout=20)
+    if shutil.which("agent-event"):   # the event store (agent-bus v2); absent until deployed
+        subprocess.run(["agent-event", "emit", "scheduling.decided", "--project", project, "--source", "agent-capacity",
+                        "--coord", coord, "--status", verdict.lower(), "--summary", text[:300],
+                        "--meta", json.dumps({"class": d["class"], "metrics": m, "reasons": d["reasons"]})]
+                       + (["--task", task] if task else []), capture_output=True, timeout=20)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--class", dest="cls", choices=LIMITS, default="light")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--record", action="store_true")
+    ap.add_argument("--project"); ap.add_argument("--task"); ap.add_argument("--as", dest="coord", default="claude")
+    a = ap.parse_args()
+    if a.record and not a.project:
+        ap.error("--record needs --project")
+    d = assess(a.cls)
+    if a.record:
+        record(d, a.project, a.task, a.coord)
+    if a.json:
+        print(json.dumps(d))
+    else:
+        print(("ALLOW" if d["allow"] else "DEFER") + f" {a.cls} agent")
+        for r in d["reasons"]:
+            print("  - " + r)
+        print("  metrics: " + json.dumps(d["metrics"]))
+    sys.exit(0 if d["allow"] else 3)
+
+
+if __name__ == "__main__":
+    main()

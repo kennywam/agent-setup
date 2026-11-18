@@ -1,0 +1,104 @@
+#!/bin/zsh
+# coord-watch: the coordinator's single background watcher (run with run_in_background).
+# Exits, which wakes the coordinator, when:
+#   - the project's board on the Mini gets a message that needs action
+#     (kind plan/question/ask-user/blocker/review/done/stopped), or
+#   - a watched Mini agent stops working (finished its turn, blocked, exited, or vanished).
+# Usage: [COORD_NAME=codex] coord-watch <project> <terminal>...    e.g. coord-watch project-a mac-mini/t2s mac-mini/t2t
+# COORD_NAME (claude, the default, or codex) names the coordinator: each has its own cursor, renews its
+# own agent-task leases, and ignores board messages from agents/tasks the other coordinator owns.
+# State: ~/.local/state/coord/<project>[.<coord>].cursor = last board message id already shown.
+project=$1; shift
+terms=("$@")
+coord=${COORD_NAME:-claude}
+hc=${AGENT_BUS_HC:-$HOME/.local/bin/hc}
+state=~/.local/state/coord; mkdir -p $state
+cursor_file=$state/$project${COORD_NAME:+.$COORD_NAME}.cursor
+[[ $coord == claude ]] && cursor_file=$state/$project.cursor
+# zsh/system is available on macOS; lock ownership stays with this process, not its hc children.
+if ! zmodload zsh/system; then
+  print -u2 "coord-watch: cannot load zsh/system for cursor locking"
+  exit 1
+fi
+if ! : >> "$cursor_file"; then
+  print -u2 "coord-watch: cannot open cursor $cursor_file"
+  exit 1
+fi
+zsystem flock -t 0 -f cursor_lock "$cursor_file" 2>/dev/null
+lock_rc=$?
+if (( lock_rc == 1 )); then
+  # Some zsh versions return I/O error for -t 0 contention; a timed retry identifies it.
+  zsystem flock -t 0.001 -f cursor_lock "$cursor_file"
+  lock_rc=$?
+fi
+if (( lock_rc != 0 )); then
+  if (( lock_rc == 2 )); then
+    print "coord-watch: already running for $project/$coord (cursor $cursor_file)"
+  else
+    print -u2 "coord-watch: cannot lock cursor $cursor_file (status $lock_rc)"
+  fi
+  exit 1
+fi
+# Closing another descriptor for this inode in the owning shell releases an fcntl lock.
+[[ -s $cursor_file ]] || (print 0 > "$cursor_file")
+typeset -A seen_working   # only count "stopped" after the agent was seen working (skips startup idle)
+
+board() { $hc exec --on mac-mini -- bash -lc "~/.local/bin/agent-msg read --project $project --after $1 --json" 2>/dev/null; }
+
+started=$SECONDS
+while true; do
+  if [[ $($hc machine ls --json | jq -r '.machines[]|select(.name=="mac-mini")|.state') != connected ]]; then
+    print "MINI UNREACHABLE: agents' state unknown (likely restarted, waiting for disk password)"; exit 0
+  fi
+  if (( SECONDS - started > 3600 )); then   # heartbeat: catches agents that keep "working" in a loop
+    print "CHECK-IN ($project): no events for 60 min. Per agent, from the board:"
+    $hc exec --on mac-mini -- bash -lc "~/.local/bin/agent-msg summary --project $project"
+    exit 0
+  fi
+  cur=$(cat "$cursor_file")
+  new=$(board $cur)
+  if [[ -n $new ]]; then
+    lastid=$(print -r -- $new | tail -1 | jq -r .id)
+    hits=$(print -r -- $new | jq -c 'select(.kind|test("^(plan|question|ask-user|blocker|review|done|stopped)$"))')
+    if [[ -n $hits ]]; then   # drop what belongs to the other coordinator: its tasks, or agents on its tasks
+      tasks=$($hc exec --on mac-mini -- bash -lc "cat ~/.agent-bus/$project.tasks.json 2>/dev/null" 2>/dev/null)
+      [[ -n $tasks ]] && hits=$(print -r -- $hits | jq -c --argjson t "$tasks" --arg me $coord '
+        def mine: .coordinator == $me or .handoff_to == $me;
+        def current($x): any(.executions[]?; .ended == null and .id == $x);
+        . as $post
+        | (if ($post.task // "") != "" then
+             [$t.tasks[] | select(.id == $post.task)]
+           else
+             [$t.tasks[] | select(.agent.terminal == $post.from or .reviewer.terminal == $post.from
+               or any(.executions[]?; .id == $post.exec and $post.exec != null))]
+           end) as $assigned
+        | select(($assigned|length) == 0 or any($assigned[]; mine))
+        | . + {stale: (($post.exec // "") != "" and ($assigned|length) > 0
+            and (any($assigned[]; mine and current($post.exec)) | not))}')
+    fi
+    (print $lastid > "$cursor_file")
+    if [[ -n $hits ]]; then
+      print "BOARD ($project): new messages, some need action"
+      print -r -- $hits | jq -r '"#\(.id) \(.from)\(if .as != "" then "/"+.as else "" end) [\(.kind)] task=\(.task // "-") exec=\(.exec // "-")\(if .stale then " [stale]" else "" end)\(if (.re//"") != "" then " re #"+.re else "" end) → \(.to): \(.text)"'
+      exit 0
+    fi
+  fi
+  for t in $terms; do
+    info=$($hc get $t --json 2>/dev/null)
+    if [[ -z $info ]] || [[ $(print -r -- $info | jq -r '.error // empty') != "" ]]; then
+      print "AGENT $t is gone (terminal not found)"; exit 0
+    fi
+    st=$(print -r -- $info | jq -r 'if .state == "finished" then "finished" else .status.state // .state // "" end')
+    [[ $st == working ]] && seen_working[$t]=1
+    if [[ $st == blocked || $st == exited || $st == finished ]] || [[ $st != working && -n ${seen_working[$t]} ]]; then
+      print "AGENT $t stopped: state=$st"
+      $hc read $t --lines 40 | grep -v '^[[:space:]]*$' | tail -20
+      exit 0
+    fi
+  done
+  # Block on the Mini until the board grows past our cursor (instant wake), at most 2 min so the
+  # terminal checks above still run. 124 = timed out quietly; anything else (Mini unreachable) backs off.
+  f="~/.agent-bus/$project.jsonl"
+  $hc exec --on mac-mini --timeout 150 -- bash -lc "~/.local/bin/agent-task renew --coord $coord --project $project >/dev/null 2>&1; touch $f; [ \$(wc -l < $f) -gt $(cat "$cursor_file") ] || timeout 120 inotifywait -qq -e modify $f" >/dev/null 2>&1
+  rc=$?; (( rc == 0 || rc == 124 )) || sleep 30
+done

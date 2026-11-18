@@ -1,0 +1,4 @@
+#!/bin/bash
+# coord on the MacBook: the operating mode lives on the Mini, so run it there.
+#   coord status | interactive | autonomous | suspend [now] | resume [interactive|autonomous] | off | on
+exec "$HOME/.local/bin/hc" exec --on mac-mini -- env COORD_NAME=user bash -lc 'coord "$@"' coord "$@"

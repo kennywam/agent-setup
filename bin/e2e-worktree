@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# e2e-worktree: one long-lived test worktree per project on the Mini (~/projects/<project>-e2e),
+# so e2e builds reuse a warm cache (apps/*/.next/cache, node_modules) instead of starting cold in
+# every agent's own worktree. Agents code in their own worktree and test here. Nobody edits here.
+#
+#   e2e-worktree use <project> <branch|sha>   take the worktree (needs a server turn), check the
+#                                             ref out detached, install deps; prints the path and
+#                                             whether the Supabase stack can be reused
+#   e2e-worktree release <project>            give it back (after stopping your servers by PID)
+#   e2e-worktree status [<project>]           who has it, which commit, since when
+#
+# Stack: keep one stack per project up between runs with the ids below. When supabase/ differs
+# from the commit the stack was built for, `use` says RECREATE: run the stack's `down` then `up`.
+#   project-a: E2E_STACK_ID=project-a-e2e E2E_STACK_PORT=25600 E2E_STACK_DIR=~/.cache/e2e-stacks/project-a
+set -euo pipefail
+BUS="${AGENT_BUS_DIR:-$HOME/.agent-bus}"
+PROJECTS="${E2E_PROJECTS_DIR:-$HOME/projects}"
+TURNS="$BUS/server-turns"
+
+agent_pid() {
+  [[ -n ${SERVER_TURN_PID:-} ]] && { echo "$SERVER_TURN_PID"; return; }
+  local pid=$$ comm
+  while [[ $pid -gt 1 ]]; do
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+    [[ $comm == claude* ]] && { echo "$pid"; return; }
+    pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || echo 1)
+  done
+  echo $$
+}
+me() { local t="${HC_TERMINAL_ID:-}"; echo "${t:-pid$(agent_pid)}"; }
+alive() { [[ -n ${1:-} && -d /proc/$1 ]]; }
+field() { sed -n "s/^$2=//p" "$1" 2>/dev/null || true; }
+
+cmd=${1:-}; project=${2:-}
+[[ $cmd == status && -z $project ]] || [[ -n $project ]] || { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+repo="$PROJECTS/$project"; wt="$PROJECTS/$project-e2e"
+owner="$BUS/e2e-owner-$project"; state="$BUS/e2e-state-$project"
+lock="$BUS/e2e-$project.lock"
+
+case "$cmd" in
+  use)
+    ref=${3:?usage: e2e-worktree use <project> <branch|sha>}
+    id=$(me)
+    [[ -e $TURNS/$id ]] || { echo "take a server turn first: server-turn wait \"$project e2e\"" >&2; exit 3; }
+    exec 9>"$lock"; flock 9
+    if [[ -e $owner ]] && [[ $(field "$owner" id) != "$id" ]] && alive "$(field "$owner" pid)"; then
+      echo "busy: $(field "$owner" id) is testing $(field "$owner" ref) here. Wait, or test in your own worktree." >&2; exit 3
+    fi
+    git -C "$repo" fetch -q origin
+    if [[ ! -d $wt ]]; then git -C "$repo" worktree add -q --detach "$wt" origin/dev; fi
+    sha=$(git -C "$repo" rev-parse --verify -q "$ref^{commit}" || git -C "$repo" rev-parse --verify -q "origin/$ref^{commit}") \
+      || { echo "unknown ref: $ref (local branches and origin/<branch> are both tried)" >&2; exit 2; }
+    # Test-only checkout: drop stray edits, keep ignored build caches and node_modules.
+    git -C "$wt" reset -q --hard && git -C "$wt" clean -qfd && git -C "$wt" checkout -q --detach "$sha"
+    printf 'id=%s\npid=%s\nref=%s\nsha=%s\nsince=%s\n' "$id" "$(agent_pid)" "$ref" "$sha" "$(date +%s)" > "$owner"
+    ( cd "$wt" && pnpm install --frozen-lockfile --prefer-offline >/tmp/e2e-install-$project.log 2>&1 ) \
+      || { echo "pnpm install failed: /tmp/e2e-install-$project.log" >&2; exit 1; }
+    stack_sha=$(field "$state" stack_sha)
+    if [[ -z $stack_sha ]] || ! git -C "$wt" cat-file -e "$stack_sha^{commit}" 2>/dev/null \
+       || ! git -C "$wt" diff --quiet "$stack_sha" "$sha" -- supabase/; then
+      stack="RECREATE (supabase/ changed since the stack was built, or no stack yet): stack down, then up"
+      printf 'stack_sha=%s\n' "$sha" > "$state"
+    else
+      stack="REUSE (supabase/ unchanged since $(git -C "$wt" rev-parse --short "$stack_sha")); reseed if your test needs fresh data"
+    fi
+    echo "worktree: $wt at $(git -C "$wt" rev-parse --short HEAD) ($ref)"
+    echo "stack: $stack" ;;
+  release)
+    exec 9>"$lock"; flock 9
+    if [[ -e $owner && $(field "$owner" id) == "$(me)" ]]; then rm -f "$owner"; echo "released $project-e2e"
+    elif [[ ${3:-} == --force ]]; then rm -f "$owner"; echo "force-released $project-e2e"
+    else echo "you don't hold $project-e2e"; fi ;;
+  status)
+    for f in "$BUS"/e2e-owner-${project:-*}; do
+      [[ -e $f ]] || { echo "no e2e worktree in use"; break; }
+      p=${f##*/e2e-owner-}; a="dead"; alive "$(field "$f" pid)" && a="alive"
+      echo "$p-e2e: $(field "$f" id) ($a) testing $(field "$f" ref) @ $(field "$f" sha | cut -c1-9), $(( ($(date +%s) - $(field "$f" since)) / 60 )) min"
+    done ;;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

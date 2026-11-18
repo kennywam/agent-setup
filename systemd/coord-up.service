@@ -1,0 +1,6 @@
+[Unit]
+Description=Start the Claude coordinator in an hc terminal if it isn't running
+
+[Service]
+Type=oneshot
+ExecStart=%h/coord/bin/coord-up

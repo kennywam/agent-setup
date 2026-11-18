@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# server-turn: agents on the Mini take turns running servers (Supabase/Docker stacks, dev or
+# production servers, Playwright, seeded test environments). One holder at a time; a second may start
+# only while the Mini has room (enough free memory and a load under the core count x2).
+#
+#   server-turn acquire <label>   take a turn now if allowed; exit 0 granted, 3 busy (prints why)
+#   server-turn wait <label>      block until granted (run it in the background or with a long timeout)
+#   server-turn release           give the turn back (after stopping your servers by PID)
+#   server-turn status            holders, their age, and the room left
+#   server-turn release --force <terminal>   coordinator only: drop a stuck holder
+#
+# A turn belongs to the calling agent (HC_TERMINAL_ID, else the nearest `claude` process). Turns
+# whose agent process has exited are dropped automatically.
+set -euo pipefail
+DIR="${AGENT_BUS_DIR:-$HOME/.agent-bus}/server-turns"
+LOCK="$DIR.lock"
+MIN_FREE_GB="${SERVER_TURN_MIN_FREE_GB:-7}"   # free memory needed to admit a second holder
+MAX_HOLDERS="${SERVER_TURN_MAX:-3}"
+mkdir -p "$DIR"
+
+agent_pid() { # nearest ancestor whose command is claude (SERVER_TURN_PID overrides, for tests)
+  [[ -n ${SERVER_TURN_PID:-} ]] && { echo "$SERVER_TURN_PID"; return; }
+  local pid=$$ comm
+  while [[ $pid -gt 1 ]]; do
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+    [[ $comm == claude* ]] && { echo "$pid"; return; }
+    pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || echo 1)
+  done
+  echo $$
+}
+me() { local t="${HC_TERMINAL_ID:-}"; echo "${t:-pid$(agent_pid)}"; }
+free_gb() { awk '/MemAvailable/{printf "%d", $2/1048576}' /proc/meminfo; }
+load_ok() { awk -v c="$(nproc)" '{exit !($1 < 2*c)}' /proc/loadavg; }
+
+prune() { # drop turns whose agent is gone
+  local f pid
+  for f in "$DIR"/*; do
+    [[ -e $f ]] || continue
+    pid=$(sed -n 's/^pid=//p' "$f")
+    [[ -n $pid && -d /proc/$pid ]] || rm -f "$f"
+  done
+}
+holders() { ls -1 "$DIR" 2>/dev/null | grep -c . || true; }
+describe() {
+  local f now; now=$(date +%s)
+  for f in "$DIR"/*; do
+    [[ -e $f ]] || continue
+    echo "  $(basename "$f"): $(sed -n 's/^label=//p' "$f"), $(( (now - $(sed -n 's/^since=//p' "$f")) / 60 )) min"
+  done
+}
+
+try_acquire() { # 0 granted, 3 busy; prints the reason when busy
+  local label=$1 id; id=$(me)
+  exec 9>"$LOCK"; flock 9
+  prune
+  if [[ -e $DIR/$id ]]; then echo "already holding: $(sed -n 's/^label=//p' "$DIR/$id")"; return 0; fi
+  local n; n=$(holders)
+  if (( n > 0 )); then
+    local why=""
+    (( n >= MAX_HOLDERS )) && why="$n holders (max $MAX_HOLDERS)"
+    (( $(free_gb) < MIN_FREE_GB )) && why="${why:+$why; }only $(free_gb) GB free (need $MIN_FREE_GB)"
+    load_ok || why="${why:+$why; }load $(cut -d' ' -f1 /proc/loadavg) on $(nproc) cores"
+    if [[ -n $why ]]; then echo "busy: $why. Holding:"; describe; return 3; fi
+  fi
+  printf 'label=%s\nsince=%s\npid=%s\n' "$label" "$(date +%s)" "$(agent_pid)" > "$DIR/$id"
+  echo "granted to $id: $label"
+}
+
+case "${1:-}" in
+  acquire) [[ -n ${2:-} ]] || { echo "usage: server-turn acquire <label>" >&2; exit 2; }; try_acquire "$2" ;;
+  wait)
+    [[ -n ${2:-} ]] || { echo "usage: server-turn wait <label>" >&2; exit 2; }
+    first=1
+    until out=$(try_acquire "$2"); do
+      [[ -n $first ]] && { echo "$out"; echo "waiting for a server turn (checks every 30 s)..."; first=""; }
+      sleep 30
+    done
+    echo "$out" ;;
+  release)
+    exec 9>"$LOCK"; flock 9
+    if [[ ${2:-} == --force ]]; then
+      [[ -n ${3:-} ]] || { echo "usage: server-turn release --force <terminal>" >&2; exit 2; }
+      rm -f "$DIR/$3"; echo "released $3"
+    else
+      id=$(me); [[ -e $DIR/$id ]] && { rm -f "$DIR/$id"; echo "released $id"; } || echo "$id holds no turn"
+    fi ;;
+  status)
+    exec 9>"$LOCK"; flock 9; prune
+    echo "holders: $(holders) (max $MAX_HOLDERS); free $(free_gb) GB (second holder needs $MIN_FREE_GB); load $(cut -d' ' -f1 /proc/loadavg) on $(nproc) cores"
+    describe ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

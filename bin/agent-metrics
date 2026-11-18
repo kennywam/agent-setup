@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# agent-metrics: board-derived state and metrics for the coordinator and the Herdr dashboard mod.
+#   agent-metrics [--json] [--gh] [project...]   default: every board in ~/.agent-bus
+#   --gh adds each PR's state and CI result (one gh call per project, from ~/projects/<project>).
+# Per agent (terminal + branch): issue, state, last message, waiting-on, PR, rounds, questions, minutes.
+# Per PR: review rounds (done posts after the first), questions/plans asked, minutes first post -> last done.
+set -euo pipefail
+BUS="${AGENT_BUS_DIR:-$HOME/.agent-bus}"
+json=0; gh=0; projects=()
+for a in "$@"; do case $a in --json) json=1;; --gh) gh=1;; *) projects+=("$a");; esac; done
+if [[ ${#projects[@]} -eq 0 ]]; then
+  for f in "$BUS"/*.jsonl; do [[ -s $f ]] && projects+=("$(basename "$f" .jsonl)"); done
+fi
+for p in "${projects[@]}"; do
+  f="$BUS/$p.jsonl"; [[ -s $f ]] || continue
+  prs='[]'
+  if [[ $gh -eq 1 && -d ~/projects/$p/.git ]]; then
+    prs=$(cd ~/projects/$p && gh pr list --state all --limit 40 --json number,state,url,statusCheckRollup \
+      --jq '[.[] | {n: (.number|tostring), state, url, ci: ([.statusCheckRollup[]? | (.conclusion // .state // "")] |
+             if any(.=="FAILURE" or .=="ERROR" or .=="CANCELLED" or .=="TIMED_OUT") then "fail"
+             elif any(.=="" or .=="PENDING" or .=="IN_PROGRESS" or .=="QUEUED" or .=="EXPECTED") then "pending"
+             elif length==0 then "" else "pass" end)}]' 2>/dev/null || echo '[]')
+  fi
+  jq -cs --arg p "$p" --argjson prs "$prs" '
+    def t: (.[0:19] + "Z") | fromdate;
+    def issue: ((.text | capture("#(?<n>[0-9]{2,6})").n) // null);
+    def pr: ((.text | capture("/pull/(?<n>[0-9]+)").n) // null);
+    [ .[] | select(.from != "unknown" and (.kind|IN("answer","decision")|not)) ] as $m
+    | ($m | group_by(.from)) as $by
+    | { project: $p,
+        agents: [ $by[] | . as $a
+          | ($a|last) as $l
+          | ([$a[]|issue|select(.)]|first) as $iss
+          | ([$a[]|pr|select(.)]|last) as $pr
+          | ([$a[]|select(.kind=="done")]|length) as $dones
+          | ($prs | map(select(.n==$pr)) | first) as $g
+          | { terminal: $l.from, pr_state: ($g.state // ""), pr_url: ($g.url // ""), ci: ($g.ci // ""), branch: ([$a[].branch|select(.!="" and .!="dev" and .!="main")]|last // ""),
+              issue: $iss, pr: $pr, last_kind: $l.kind, last_at: $l.ts, last_text: ($l.text[0:160]),
+              waiting_on: (if $l.kind|IN("plan","question","blocker","stopped") then "coordinator"
+                           elif $l.kind=="ask-user" then "user"
+                           elif $l.kind=="done" then "review" else "" end),
+              questions: ([$a[]|select(.kind|IN("question","ask-user"))]|length),
+              plans: ([$a[]|select(.kind=="plan")]|length),
+              review_rounds: ([$dones-1,0]|max),
+              minutes: ((($l.ts|t) - ($a[0].ts|t))/60|floor) } ],
+        totals: { prs: ([$m[]|select(.kind=="done")|pr|select(.)]|unique|length),
+                  questions: ([$m[]|select(.kind|IN("question","ask-user"))]|length),
+                  stopped: ([$m[]|select(.kind=="stopped")]|length),
+                  blockers: ([$m[]|select(.kind=="blocker")]|length) } }' "$f"
+done | if [[ $json -eq 1 ]]; then jq -cs .; else jq -r '
+  .project as $p | "== \($p): \(.totals.prs) PRs, \(.totals.questions) questions, \(.totals.blockers) blockers, \(.totals.stopped) stalls",
+  (.agents[] | "  \(.terminal) #\(.issue // "?") \(if .pr then "PR "+.pr+" "+.pr_state+" "+.ci else "" end) [\(.last_kind)] \(.last_at[11:16]) rounds=\(.review_rounds) q=\(.questions) mins=\(.minutes)\(if .waiting_on!="" then " waiting:"+.waiting_on else "" end)")'; fi

@@ -1,0 +1,11 @@
+#!/bin/bash
+# agent-msg on the MacBook: forwards to the board on the Mini, for agents the Mini coordinator starts
+# here. The sender shows as macbook/<terminal>, which the coordinator can hc send to.
+[ "$1" = verify ] && { echo "MacBook tasks don't run local checks: push, and CI on the PR is the check. post done needs no verify here."; exit 0; }
+args=("$@") prev=
+for a in "$@"; do [ "$prev" = --project ] && proj=$a; prev=$a; done
+if [ -z "$proj" ] && common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+  args+=(--project "$(basename "$(dirname "$common")")")
+fi
+exec "$HOME/.local/bin/hc" exec --on mac-mini -- env HC_TERMINAL_ID="macbook/${HC_TERMINAL_ID:-unknown}" \
+  AGENT_TASK="${AGENT_TASK:-}" AGENT_REMOTE=macbook bash -lc 'agent-msg "$@"' agent-msg "${args[@]}"

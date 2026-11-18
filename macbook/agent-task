@@ -1,0 +1,3 @@
+#!/bin/bash
+# agent-task on the MacBook: runs it on the Mini, where the task registry lives.
+exec "$HOME/.local/bin/hc" exec --on mac-mini -- env AGENT_TASK="${AGENT_TASK:-}" bash -lc 'agent-task "$@"' agent-task "$@"

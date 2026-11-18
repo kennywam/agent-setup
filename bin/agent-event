@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Structured event timeline and fleet observations."""
+import argparse
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+import sys
+import sqlite3
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'lib'))
+from agentbus import events, fleet, store
+
+
+def prune(conn, days):
+    if days < 0:
+        raise ValueError('days must be nonnegative')
+    path, _ = fleet.registries(conn)
+    protected, readable, project_tasks = set(), set(), {}
+    for file in path.glob('*.tasks.json'):
+        project = file.name[:-11]
+        try:
+            tasks = json.loads(file.read_text())['tasks']
+            for task in tasks.values():
+                if task['status'] not in ('completed', 'failed', 'cancelled'):
+                    protected.add(fleet.correlation(project, task, tasks))
+            readable.add(project)
+            project_tasks[project] = tasks
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    with conn:
+        rows = conn.execute('SELECT seq, project_id, task_id, correlation_id FROM events WHERE timestamp < ?', (cutoff,)).fetchall()
+        for row in rows:
+            project = row['project_id']
+            if project is None:
+                conn.execute('DELETE FROM events WHERE seq=?', (row['seq'],))
+                continue
+            if project not in readable:
+                continue
+            tree = row['correlation_id']
+            if not tree and row['task_id'] in project_tasks[project]:
+                tree = fleet.correlation(project, project_tasks[project][row['task_id']], project_tasks[project])
+            has_open_task = any(c.startswith(project + ':') for c in protected)
+            if (tree and tree not in protected) or (not tree and not has_open_task):
+                conn.execute('DELETE FROM events WHERE seq=?', (row['seq'],))
+        ended = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+        conn.execute("DELETE FROM agents WHERE state='exited' AND ended_at < ? AND coalesce(callback_pending,'') != '1'", (ended,))
+    conn.execute('VACUUM')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+    emit = commands.add_parser('emit')
+    emit.add_argument('type')
+    for flag, dest in [('project', 'project_id'), ('task', 'task_id'), ('agent', 'agent_id'),
+                       ('exec', 'execution_id'), ('provider', 'provider'), ('coord', 'coordinator_id'),
+                       ('status', 'status'), ('summary', 'summary'), ('key', 'natural_key')]:
+        emit.add_argument('--' + flag, dest=dest, required=flag == 'project', **({'default': ''} if flag == 'summary' else {}))
+    emit.add_argument('--source', default='agent-event')
+    emit.add_argument('--meta', type=json.loads, default={})
+    timeline = commands.add_parser('timeline')
+    timeline.add_argument('--project', dest='project_id')
+    subject = timeline.add_mutually_exclusive_group()
+    subject.add_argument('--task', dest='task_id')
+    subject.add_argument('--correlation', dest='correlation_id')
+    timeline.add_argument('--limit', type=int, default=1000)
+    timeline.add_argument('--after', type=int, default=0)
+    timeline.add_argument('--json', action='store_true')
+    agents = commands.add_parser('agents')
+    agents.add_argument('--all', action='store_true')
+    agents.add_argument('--json', action='store_true')
+    commands.add_parser('probe')
+    export = commands.add_parser('export')
+    export.add_argument('--after', type=int, required=True)
+    export.add_argument('--limit', type=int, default=500)
+    clean = commands.add_parser('prune')
+    clean.add_argument('--days', type=int, default=180)
+    args = vars(parser.parse_args())
+    command = args.pop('command')
+    if command == 'timeline' and args.get('task_id') and not args.get('project_id'):
+        parser.error('timeline --task requires --project')
+    if command == 'emit':
+        kind, metadata = args.pop('type'), args.pop('meta')
+        result = events.emit(kind, metadata=metadata, **args)
+        if result:
+            print(json.dumps(result))
+        return
+    database = store.bus_path() / 'events.db'
+    if command == 'export' and database.exists():
+        conn = sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)
+        conn.row_factory = sqlite3.Row
+    else:
+        conn = store.connect()
+    try:
+        if command == 'prune':
+            prune(conn, args['days'])
+            return
+        if command == 'probe':
+            rows = fleet.probe(conn)
+        elif command == 'agents':
+            rows = [dict(r) for r in conn.execute('SELECT * FROM agents' + ('' if args['all'] else " WHERE coalesce(state,'') != 'exited'"))]
+            if args['json']:
+                print(json.dumps(rows))
+                return
+            for row in rows:
+                print(f'{row["execution_id"]}\t{row["state"]}\t{row["project_id"] or "-"}\t{row["task_id"] or "-"}')
+            return
+        else:
+            limit = args.pop('limit', 1000)
+            if limit < 0 or args['after'] < 0:
+                parser.error('limit and after must be nonnegative')
+            after = args.pop('after')
+            as_json = args.pop('json', command == 'export')
+            rows = store.query_events(conn, after_seq=after, limit=limit, **args)
+            if not as_json:
+                for row in rows:
+                    print(f'{row["seq"]}\t{row["timestamp"]}\t{row["event_type"]}\t{row["summary"]}')
+                return
+        for row in rows:
+            print(json.dumps(row))
+    finally:
+        conn.close()
+
+
+if __name__ == '__main__':
+    main()

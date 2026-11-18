@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "~/.local/bin/coord-mode hook" }] }
+    ],
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "~/.local/bin/coord-mode hook" }] }
+    ]
+  },
+  "statusLine": { "type": "command", "command": "~/.local/bin/coord-statusline", "refreshInterval": 60 }
+}

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# agent-task-test: self-check for agent-task + agent-msg task links. Uses a throwaway bus dir, never the live boards.
+# Usage: agent-task-test [dir-with-agent-task-and-agent-msg]   (default: ~/.local/bin)
+set -uo pipefail
+bin="${1:-$HOME/.local/bin}"
+export AGENT_BUS_DIR; AGENT_BUS_DIR=$(mktemp -d); trap 'rm -rf "$AGENT_BUS_DIR"' EXIT
+cd "$AGENT_BUS_DIR"   # not a git repo, so nothing reads a real worktree
+export AGENT_BUS_HC="$AGENT_BUS_DIR/fake-hc"   # never the real Herdr: every terminal exists, started at ms 1
+printf '#!/bin/sh\necho "{\\"address\\":\\"$2\\",\\"state\\":\\"live\\",\\"status\\":{\\"app\\":\\"claude-code\\",\\"state\\":\\"working\\"},\\"created_ms\\":1}"\n' > "$AGENT_BUS_HC"; chmod +x "$AGENT_BUS_HC"
+T() { "$bin/agent-task" "$@" --project demo; }
+M() { HC_TERMINAL_ID="$1" "$bin/agent-msg" post "${@:2}" --project demo >/dev/null; }
+st() { jq -r --arg id "$1" '.tasks[$id].status' "$AGENT_BUS_DIR/demo.tasks.json"; }
+fails=0
+ok()   { if "$@" >/dev/null 2>&1; then echo "ok   $*"; else echo "FAIL $*"; fails=$((fails+1)); fi; }
+nope() { if "$@" >/dev/null 2>&1; then echo "FAIL (should refuse) $*"; fails=$((fails+1)); else echo "ok   refused: $*"; fi; }
+eq()   { if [[ $1 == "$2" ]]; then echo "ok   $3"; else echo "FAIL $3: got '$1' want '$2'"; fails=$((fails+1)); fi; }
+
+eq "$(T new "payment workflow" --coord claude --issue 12)" T1 "new gives T1"
+nope T new "same issue again" --coord codex --issue 12
+eq "$(T new "endpoints" --coord claude --issue 12 --parent T1 --files apps/api/payments)" T2 "subtask on same issue allowed"
+eq "$(T new "ui" --coord codex --issue 12 --parent T1 --deps T2 --files apps/web/pay)" T3 "codex creates dependent subtask"
+nope T new "overlapping files" --coord codex --files apps/api/payments/routes.ts
+nope T assign T2 --coord codex --agent codex --terminal t9a        # owned by claude
+ok   T assign T2 --coord claude --agent codex --terminal t9a --model gpt
+nope T assign T3 --coord codex --agent claude --terminal t9b       # T2 not completed yet
+M t9a plan "plan for endpoints" --task T2
+eq "$(st T2)" in_progress "plan post moves assigned -> in_progress"
+M t9z status "someone else" --task T2
+M t9a done "PR https://x/pull/5" --task T2 2>/dev/null || true       # no .verify file in demo: done allowed
+eq "$(st T2)" review "done post moves in_progress -> review"
+nope T set T2 --coord claude --reviewer t9a                         # author can't review own work
+ok   T set T2 --coord claude --reviewer t9c --reviewer-agent claude
+nope T status T2 pending --coord claude                             # review -> pending not allowed
+nope T status T2 completed --coord claude                           # v2: tests, review, integration gates pending
+ok   T gate T2 tests passed --coord claude --evidence "npm test"
+M t9c review "looks good. VERDICT: approve" --task T2                # legacy verdict text is parsed
+ok   T gate T2 integration n/a --coord claude --reason "test"
+ok   T status T2 completed --coord claude
+ok   T assign T3 --coord codex --agent claude --terminal t9b
+nope T claim T1 --coord codex                                       # lease active
+AGENT_TASK_TTL_MIN=0 "$bin/agent-task" renew --coord claude --project demo; sleep 1
+nope T claim T1 --coord codex                                       # v2: a plain claim of another's task is refused
+ok   T claim T1 --coord codex --recover --reason "lease expired"     # lease expired, no live execution: recovery
+ok   T status T1 in_progress --coord codex                           # parent run by its coordinator
+nope T status T1 completed --coord codex                             # v2: child T3 is still open
+ok   T status T1 completed --coord codex --force --reason "test"
+ok   T handoff T3 --coord codex --to claude
+ok   T accept T3 --coord claude                                      # v2: handoff is two-phase
+eq "$(T show T2 | grep -c '\[plan\]\|\[done\]')" 2 "show includes the agent's plan and done"
+eq "$(T ls | wc -l | tr -d ' ')" 1 "ls lists the 1 open task"
+for i in $(seq 1 12); do (T new "parallel $i" --coord codex >/dev/null 2>&1) & done; wait
+eq "$(jq '[.tasks[]|select(.title|startswith("parallel"))]|length' "$AGENT_BUS_DIR/demo.tasks.json")" 12 "12 parallel creates all succeed with unique ids"
+w=$(AM="$bin/agent-msg" env -u HC_TERMINAL_ID bash -c 'exec -a "codex app-server" bash -c "\"\$AM\" post status daemon-check --project demo 2>&1 >/dev/null; true"')
+eq "$(grep -c "codex --no-daemon" <<<"$w")" 1 "agent-msg warns when run under the shared Codex daemon"
+w=$(env -u HC_TERMINAL_ID "$bin/agent-msg" post status no-daemon-check --project demo 2>&1 >/dev/null)
+eq "$w" "" "no warning outside the daemon (coordinator posts over hc exec)"
+echo; [[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

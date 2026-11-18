@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# hc for the coordinator on the Mini. The rules address the Mini as a remote machine
+# ("hc exec --on mac-mini", "mac-mini/t7"); here that machine is this one, so run locally.
+# Other machines (--on macbook, macbook/t3) pass through.
+args=() on= done=
+for a in "$@"; do
+  if [ -n "$done" ]; then args+=("$a"); continue; fi
+  if [ -n "$on" ]; then on=; [ "$a" = mac-mini ] || args+=(--on "$a"); continue; fi
+  case $a in
+    --) done=1; args+=("$a") ;;
+    --on) on=1 ;;
+    --on=mac-mini) ;;
+    mac-mini/*) args+=("${a#mac-mini/}") ;;
+    *) args+=("$a") ;;
+  esac
+done
+if [ "${args[0]}" = machine ] && [ "${args[1]}" = ls ]; then
+  echo '{"machines":[{"name":"mac-mini","state":"connected"}]}'; exit 0
+fi
+exec "$HOME/.local/bin/hc" "${args[@]}"
